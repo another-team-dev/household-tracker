@@ -82,3 +82,15 @@ input[type=checkbox].sw, .check input, input[type=radio] { width: 22px; height: 
 .fl { position: relative; display: block; } .fl span { position: absolute; left: 10px; top: 13px; padding: 0 4px; color: var(--grey); font-size: 16px; pointer-events: none; transition: top .12s, font-size .12s; border-radius: 4px; }
 .fl input:focus + span, .fl input:not(:placeholder-shown) + span { top: -8px; font-size: 11px; font-weight: 600; background: #fff; color: var(--acc-t); }
 @media (prefers-reduced-motion: reduce) { .fl span { transition: none; } }
+
+.danger-t { color: var(--red); }
+.sheet .check { font-size: 14px; }
+
+/* assistant chat */
+.chat { padding-bottom: 104px; }
+.bub { max-width: 86%; padding: 10px 14px; border-radius: 16px; line-height: 21px; overflow-wrap: anywhere; display: flex; flex-direction: column; gap: 6px; }
+.bub.me { align-self: flex-end; background: var(--acc); color: #fff; border-bottom-right-radius: 4px; } .bub.bot { align-self: flex-start; background: #fff; border: 1px solid var(--line); border-bottom-left-radius: 4px; } .bub.typing { color: var(--grey); letter-spacing: 3px; }
+.attach { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; background: rgba(255, 255, 255, .18); border-radius: 8px; padding: 6px 8px; align-self: flex-start; }
+.bub-acts { display: flex; flex-wrap: wrap; gap: 4px 16px; } .bub-acts .link { min-height: 32px; font-size: 13px; }
+.composer { position: fixed; left: 0; right: 0; bottom: 0; background: #fff; border-top: 1px solid var(--line); padding: 10px 16px calc(14px + env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 8px; z-index: 5; } .composer .round { color: var(--acc-t); } .composer input { border-radius: 22px; min-height: 44px; font-size: 14px; background: #F3F4F1; } .composer .send { background: var(--acc); border-color: var(--acc); color: #fff; }
+#chat-end { height: 1px; scroll-margin-bottom: 120px; }

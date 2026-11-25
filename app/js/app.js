@@ -5,8 +5,9 @@ const SOON_DAYS = 7; // "needs attention" window; deliberately independent of re
 const SECTIONS = ['attention', 'categories', 'recent', 'shopping', 'low'];
 const DEFAULT_LAYOUT = { order: SECTIONS, hidden: ['shopping', 'low'] };
 const UNITS = ['minutes', 'hours', 'days', 'weeks'];
+const SCOPES = ['new_and_empty', 'all', 'new'];
 
-const S = { user: null, hh: null, items: [], cats: [], rules: [], shop: [], layout: DEFAULT_LAYOUT, q: '', filter: 'all', openRule: null, draft: null, more: false, ready: false };
+const S = { user: null, hh: null, items: [], cats: [], rules: [], shop: [], layout: DEFAULT_LAYOUT, q: '', filter: 'all', openRule: null, draft: null, more: false, archive: [], scope: null, pendingTpl: null, chat: [], typing: false, ready: false };
 let api;
 
 // ---------- helpers ----------
@@ -22,6 +23,10 @@ const qty = (i) => (i.unit ? `${num(i.quantity)} ${i.unit}` : `×${num(i.quantit
 const cat = (id) => S.cats.find((c) => c.id === id);
 const catName = (id) => cat(id)?.name ?? t('uncategorized');
 const item = (id) => S.items.find((i) => i.id === id);
+const defaultsFor = (i) => S.rules.filter((r) => !r.item_id && (!r.applies_from || !i || new Date(i.created_at) >= new Date(r.applies_from)));
+const ownRules = (i) => S.rules.filter((r) => r.item_id === i.id);
+// The reminders that actually apply to an item: its own, otherwise the home defaults meant for it.
+const rulesFor = (i) => (ownRules(i).length ? ownRules(i) : defaultsFor(i));
 
 function info(i) {
   const left = i.due_date ? diff(i.due_date, today()) : null;
@@ -84,10 +89,10 @@ function friendly(e) {
   return t('errGeneric') + ' (' + m.slice(0, 120) + ')';
 }
 // Small in-page dialog: resolves to true / the typed text, or null when cancelled.
-function ask({ title, body = '', input = null, ok = t('ok'), danger = false, v = '', max = '', placeholder = '' }) {
+function ask({ title, body = '', input = null, ok = t('ok'), cancel = t('cancel'), danger = false, v = '', max = '', placeholder = '' }) {
   return new Promise((resolve) => {
     const field = input === null ? '' : `<div class="field"><input id="ask-input" value="${esc(input)}" ${v ? `data-v="${v}"` : ''} ${max ? `data-max="${max}"` : ''} ${v === 'date' || v === 'days' ? 'inputmode="numeric"' : ''} placeholder="${esc(placeholder)}" maxlength="60" autocomplete="off" aria-label="${esc(title)}"><p class="msg" role="alert"></p></div>`;
-    $('#modal').innerHTML = `<div class="backdrop"><form class="sheet" id="ask-form" novalidate><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${field}<div class="row-btns"><button type="button" class="btn soft" data-ask="cancel">${t('cancel')}</button><button type="submit" class="btn ${danger ? 'danger' : 'pri'}">${esc(ok)}</button></div></form></div>`;
+    $('#modal').innerHTML = `<div class="backdrop"><form class="sheet" id="ask-form" novalidate><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${field}<div class="row-btns"><button type="button" class="btn soft" data-ask="cancel">${esc(cancel)}</button><button type="submit" class="btn ${danger ? 'danger' : 'pri'}">${esc(ok)}</button></div></form></div>`;
     const done = (val) => { $('#modal').innerHTML = ''; resolve(val); };
     $('#ask-form').addEventListener('submit', (e) => {
       e.preventDefault();
@@ -102,10 +107,10 @@ function ask({ title, body = '', input = null, ok = t('ok'), danger = false, v =
   });
 }
 // A short list of choices; resolves to the chosen value or null.
-function choose({ title, body = '', options }) {
+function choose({ title, body = '', options, remember = '' }) {
   return new Promise((resolve) => {
-    $('#modal').innerHTML = `<div class="backdrop"><div class="sheet" role="dialog" aria-label="${esc(title)}"><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${options.map((o, n) => `<button class="btn ${o.on ? 'pri' : 'line'}" data-choice="${n}">${esc(o.label)}</button>`).join('')}<button class="btn soft" data-choice="-1">${t('cancel')}</button></div></div>`;
-    $('#modal').querySelectorAll('[data-choice]').forEach((b) => b.addEventListener('click', () => { $('#modal').innerHTML = ''; resolve(options[b.dataset.choice]?.value ?? null); }));
+    $('#modal').innerHTML = `<div class="backdrop"><div class="sheet" role="dialog" aria-label="${esc(title)}"><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${options.map((o, n) => `<button class="btn ${o.on ? 'pri' : 'line'}" data-choice="${n}">${esc(o.label)}</button>`).join('')}${remember ? `<label class="check"><input type="checkbox" id="choose-remember">${esc(remember)}</label>` : ''}<button class="btn soft" data-choice="-1">${t('cancel')}</button></div></div>`;
+    $('#modal').querySelectorAll('[data-choice]').forEach((b) => b.addEventListener('click', () => { choose.remembered = !!$('#choose-remember')?.checked; $('#modal').innerHTML = ''; resolve(options[b.dataset.choice]?.value ?? null); }));
     $('#modal').querySelector('[data-choice]').focus();
   });
 }
@@ -150,7 +155,9 @@ async function load(...tables) {
   const rows = await Promise.all(keys.map((k) => api.select(map[k], S.hh.id)));
   keys.forEach((k, n) => { S[k] = rows[n]; });
   // Nothing with quantity 0 is kept or counted: an item that is used up leaves the inventory.
-  S.items = S.items.filter((i) => num(i.quantity) > 0);
+  // Archived items (used up, thrown away, removed) live in their own list and are not counted.
+  const gone = (i) => !!i.archived_at || num(i.quantity) <= 0;
+  if (keys.includes('items')) { S.archive = S.items.filter(gone).sort((a, b) => String(b.archived_at || '').localeCompare(String(a.archived_at || ''))); S.items = S.items.filter((i) => !gone(i)); }
   S.cats.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
 }
 async function enter() {
@@ -173,22 +180,20 @@ async function patchItem(i, patch, message, kind, amount) {
   toast(message, async () => { await api.update('items', i.id, before); await load('items'); render(); toast(t('undone')); });
 }
 
-// Take an item out of the inventory and offer Undo that puts it back with its reminders.
-async function removeItem(i, message, kind, amount) {
-  const rules = S.rules.filter((x) => x.item_id === i.id);
-  await api.remove('items', i.id);
-  if (kind) api.insert('activity_log', { household_id: S.hh.id, item_name: i.name, kind, quantity: amount, unit: i.unit || '' }).catch(() => {});
-  await load('items', 'rules');
+// Move an item to the archive (used up, thrown away, removed). Nothing is deleted; Undo puts it straight back.
+async function archiveItem(i, message, reason, kind, amount) {
+  await api.update('items', i.id, { archived_at: new Date().toISOString(), archive_reason: reason });
+  if (kind) log(i, kind, amount);
+  await load('items');
   if (route().name === 'item' && route().id === i.id) back(); else render();
-  const { due_date, created_at, updated_at, ...row } = i;
-  toast(message, async () => { await api.insert('items', row); for (const { created_at: c, updated_at: u, ...x } of rules) await api.insert('reminder_rules', x); await load('items', 'rules'); render(); toast(t('undone')); });
+  toast(message, async () => { await api.update('items', i.id, { archived_at: null, archive_reason: null }); await load('items'); render(); toast(t('undone')); });
 }
 
 // ---------- views ----------
 const icon = (name, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
 const ICONS = {
   back: 'm14 5-7 7 7 7', plus: 'M12 5v14M5 12h14', close: 'M6 6l12 12M6 18 18 6', search: 'M20 20l-5-5M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z',
-  more: 'M5 12h.01M12 12h.01M19 12h.01', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4', spark: 'm12 3 3 6 6 3-6 3-3 6-3-6-6-3 6-3Z',
+  more: 'M5 12h.01M12 12h.01M19 12h.01', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4', spark: 'm12 3 3 6 6 3-6 3-3 6-3-6-6-3 6-3Z', camera: 'M4 6h4l2-3h4l2 3h4v14H4ZM16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z', mic: 'M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0ZM5 10v2a7 7 0 0 0 14 0v-2M12 19v3', send: 'm5 12 7-7 7 7M12 5v15',
   home: 'M3 10 12 3l9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z', cal: 'M4 6h16v15H4ZM4 10h16M8 3v5M16 3v5', down: 'm6 9 6 6 6-6', up: 'm6 15 6-6 6 6',
 };
 const top = (label, right = '') => `<div class="top"><button class="link backlink" data-act="back">${icon('back')}${esc(label)}</button>${right}</div>`;
@@ -294,16 +299,17 @@ function vItem(r) {
       ? `${kv(t('opened'), fmtDate(i.opened_on))}<p class="small muted">${t('useBy', { d: fmtDate(i.due_date) })}</p><button class="btn soft" data-act="unopen" data-id="${i.id}">${t('clearOpened')}</button>`
       : `${kv(t('opened'), t('notYet'))}<p class="q">${t('haveYouOpened')}</p><div class="row-btns"><button class="btn pri" data-act="openToday" data-id="${i.id}">${t('openedToday')}</button><button class="btn line" data-act="openOther" data-id="${i.id}">${t('anotherDate')}</button></div><p class="small muted">${t('ifOpenedToday', { d: fmtDate(addDays(today(), i.after_opening_days)) })}</p>`)
     : `<button class="link" data-act="setPao" data-id="${i.id}">${t('addAfterOpening')}</button>`;
-  const own = S.rules.filter((x) => x.item_id === i.id);
+  const own = ownRules(i), effective = rulesFor(i);
   return `<main class="page">${top(catName(i.category_id), `<a class="link" href="#/edit/${i.id}">${t('edit')}</a>`)}
     <div class="top">${h1(i.name, `${catName(i.category_id)} · ${qty(i)}${i.location ? ' · ' + i.location : ''}`)}${pill(i)}</div>
     <div class="card pad">${i.date_type !== 'none' ? kv(t('dt_' + i.date_type), i.printed_date ? fmtDate(i.printed_date) + (i.estimated ? ` (${t('estimated')})` : '') : t('notSet')) : kv(t('date'), t('noDate'))}${i.after_opening_days ? kv(t('afterOpening'), t('withinDays', { n: i.after_opening_days })) : ''}${openBlock}</div>
     ${quickBtns(i)}
     ${i.interval_days ? `<button class="btn line" data-act="replaced" data-id="${i.id}">${t('replacedToday', { n: i.interval_days })}</button>` : ''}
-    <div class="card pad"><div class="kv"><span>${t('remindersN', { n: own.length || S.rules.filter((x) => !x.item_id).length })}</span><b>${own.length ? t('ownReminders') : t('usingDefaults')}</b></div><p class="small muted">${esc((own.length ? own : S.rules.filter((x) => !x.item_id)).map(ruleSummary).join(' · ') || t('noReminders'))}</p><a class="btn line" href="#/reminders/${i.id}">${icon('bell')}${t('changeReminders')}</a></div>
+    <div class="card pad"><div class="kv"><span>${t('remindersN', { n: effective.length })}</span><b>${own.length ? t('ownReminders') : t('usingDefaults')}</b></div><p class="small muted">${esc(effective.map(ruleSummary).join(' · ') || t('noReminders'))}</p><a class="btn line" href="#/reminders/${i.id}">${icon('bell')}${t('changeReminders')}</a></div>
     <button class="btn soft" data-act="toShop" data-id="${i.id}">${t('addToShopping')}</button>
     ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ''}
-    <button class="link danger center" data-act="delItem" data-id="${i.id}">${t('deleteItem')}</button></main>`;
+    <button class="btn soft" data-act="toArchive" data-id="${i.id}">${t('moveToArchive')}</button>
+    <button class="link danger center" data-act="delForever" data-id="${i.id}">${t('deleteForever')}</button></main>`;
 }
 
 function blankDraft(r) {
@@ -380,10 +386,10 @@ function vReminders(r) {
   const i = isDefault ? null : item(r.id);
   if (!isDefault && !i) return `<main class="page">${top(t('back'))}${empty(t('itemGone'))}</main>`;
   const own = S.rules.filter((x) => (isDefault ? !x.item_id : x.item_id === r.id));
-  const defaults = S.rules.filter((x) => !x.item_id);
+  const defaults = defaultsFor(i);
   const unitSel = (name, cur) => `<select name="${name}" aria-label="${t('unit')}">${UNITS.map((u) => `<option value="${u}" ${cur === u ? 'selected' : ''}>${t('u_' + u, { n: 2 })}</option>`).join('')}</select>`;
   const box = (x, n) => {
-    if (S.openRule !== x.id) return `<div class="card"><button class="row" data-act="openRule" data-id="${x.id}" aria-expanded="false"><span class="grow"><span class="row-t">${esc(ruleSummary(x))}</span><span class="row-m">${esc(fireText(x, i))}</span></span>${icon('down')}</button></div>`;
+    if (S.openRule !== x.id) return `<div class="card"><button class="row" data-act="openRule" data-id="${x.id}" aria-expanded="false"><span class="grow"><span class="row-t">${esc(ruleSummary(x))}</span><span class="row-m">${esc(x.applies_from ? t('onlyNewSince', { d: fmtDate(iso(new Date(x.applies_from))) }) : fireText(x, i))}</span></span>${icon('down')}</button></div>`;
     return `<form class="card pad rule" data-rule="${x.id}"><div class="inline between"><b>${t('reminderN', { n })}</b><span class="inline"><button type="button" class="round flat" data-act="delRule" data-id="${x.id}" aria-label="${t('deleteReminder')}">${icon('close')}</button><button type="button" class="round flat" data-act="openRule" data-id="" aria-label="${t('closeReminder')}" aria-expanded="true">${icon('up')}</button></span></div>
       <div class="field"><span>${t('when')}</span><div class="inline"><input name="offset_amount" type="number" inputmode="numeric" min="0" max="10000" class="tiny" value="${x.offset_amount}" aria-label="${t('amount')}" ${x.anchor === 'fixed' ? 'disabled' : ''}>${unitSel('offset_unit', x.offset_unit)}<select name="anchor" aria-label="${t('relativeTo')}">${['due', 'opened', 'fixed'].map((a) => `<option value="${a}" ${x.anchor === a ? 'selected' : ''}>${t('a_' + a)}</option>`).join('')}</select></div></div>
       ${x.anchor === 'fixed' ? `<label class="field"><span>${t('exactMoment')}</span><input name="fixed_at" type="datetime-local" value="${x.fixed_at ? localInput(x.fixed_at) : ''}"></label>` : `<label class="inline between"><span class="lab">${t('atTime')}</span><input name="at_time" type="time" value="${x.at_time.slice(0, 5)}"></label>`}
@@ -391,7 +397,7 @@ function vReminders(r) {
       ${x.repeat_every_amount ? `<div class="inline"><span>${t('every')}</span><input name="repeat_every_amount" type="number" inputmode="numeric" min="1" max="10000" class="tiny" value="${x.repeat_every_amount}" aria-label="${t('amount')}">${unitSel('repeat_every_unit', x.repeat_every_unit)}</div>
         <label class="inline"><input type="radio" name="stop" value="count" ${x.repeat_count ? 'checked' : ''}>${t('stopAfter')}<input name="repeat_count" type="number" inputmode="numeric" min="1" max="100" class="tiny" value="${x.repeat_count || 3}" aria-label="${t('times')}">${t('moreTimes')}</label>
         <label class="inline"><input type="radio" name="stop" value="done" ${x.repeat_count ? '' : 'checked'}>${t('keepUntilDone')}</label>` : ''}
-      <p class="hint">${esc(fireText(x, i))}</p><p class="error" role="alert"></p>${x.item_id ? `<button type="button" class="btn soft" data-act="makeDefault" data-id="${x.id}">${t('makeDefault')}</button>` : ''}</form>`;
+      <p class="hint">${esc(fireText(x, i))}</p><p class="error" role="alert"></p>${!x.item_id ? '' : S.rules.some((y) => y.id === x.template_id) ? `<p class="small muted">${t('isLinked')}</p>` : `<button type="button" class="btn soft" data-act="makeDefault" data-id="${x.id}">${t('makeDefault')}</button>`}</form>`;
   };
   const inherited = !isDefault && !own.length;
   const shownRules = inherited ? defaults : own;
@@ -413,15 +419,68 @@ function vAlerts() {
     ${later.length ? `<p class="sec">${t('snoozedSection')}</p>${later.map((i) => `<div class="card pad"><a class="row bare" href="#/item/${i.id}"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${esc(t('snoozedUntil', { d: fmtDateTime(i.snoozed_until) }))}</span></span>${pill(i)}</a><button class="btn line" data-act="wake" data-id="${i.id}">${t('remindNow')}</button></div>`).join('')}` : ''}</main>${nav('alerts')}`;
 }
 
-function vAssistant() {
-  return `<main class="page">${top(t('home'))}${h1(t('assistant'), t('assistantSub'))}<div class="card pad"><p>${t('assistantSoon')}</p><a class="btn pri" href="#/edit/new">${t('addManually')}</a></div></main>`;
+// ---------- assistant: scripted demo ----------
+// The real assistant (step 3) is not connected yet. Until then the camera and microphone buttons play the two
+// scripted examples from the prototype. The items they add are real, and Undo works inside the chat.
+const chatOps = {};
+let chatSeq = 0;
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+function say(role, text, extra = {}) { const m = { id: ++chatSeq, role, text, ...extra }; S.chat.push(m); drawChat(); return m; }
+async function botSay(text, extra) { S.typing = true; drawChat(); await pause(700); S.typing = false; return say('bot', text, extra); }
+function drawChat() { if (route().name !== 'assistant') return; render(); $('#chat-end')?.scrollIntoView({ block: 'end' }); }
+async function ensureCat(key) {
+  const names = [t(key), ...['en', 'ko'].map((l) => t(key, {}, l))].map((x) => x.toLowerCase());
+  const found = S.cats.find((c) => names.includes(c.name.toLowerCase()));
+  if (found) return found;
+  const made = await api.insert('categories', { household_id: S.hh.id, name: t(key), sort_order: S.cats.length });
+  await load('cats');
+  return made;
 }
+function vAssistant() {
+  const bubble = (m) => {
+    if (m.role === 'user') return `<div class="bub me">${m.photo ? `<span class="attach">${icon('camera')}${t('demoPhotoTag')}</span>` : ''}${m.voice ? `<span class="attach">${icon('mic')}${t('demoVoiceTag')}</span>` : ''}${esc(m.text)}</div>`;
+    const op = chatOps[m.id];
+    const replies = m.replies && !m.answered ? `<div class="chips wrap">${m.replies.map((k) => `<button class="chip big" data-act="demoReply" data-id="${m.id}" data-key="${k}">${t(k)}</button>`).join('')}</div>` : '';
+    const acts = (m.items || []).filter(item).map((id) => `<a class="link" href="#/item/${id}">${esc(t('viewItem', { name: item(id).name }))}</a>`).join('')
+      + (op && !m.undone ? `<button class="link" data-act="chatUndo" data-id="${m.id}">${t('undo')}</button>` : '')
+      + (m.redoOf && !m.redone ? `<button class="link" data-act="chatRedo" data-id="${m.id}">${t('addBack')}</button>` : '');
+    return `<div class="bub bot">${esc(m.text)}${acts ? `<div class="bub-acts">${acts}</div>` : ''}</div>${replies}`;
+  };
+  return `<main class="page chat">${top(t('home'), S.chat.length ? `<button class="link" data-act="clearChat">${t('clearChat')}</button>` : '')}${h1(t('assistant'), t('assistantSub'))}
+    <p class="notice">${t('demoNote')}</p>
+    ${S.chat.length ? '' : `<div class="card pad"><p>${t('demoIntro')}</p><button class="btn pri" data-act="demoPhoto">${icon('camera')}${t('demoPlayPhoto')}</button><button class="btn pri" data-act="demoVoice">${icon('mic')}${t('demoPlayVoice')}</button><a class="btn line" href="#/edit/new">${t('addManuallyBtn')}</a></div>`}
+    ${S.chat.map(bubble).join('')}${S.typing ? `<div class="bub bot typing" aria-label="${t('typing')}">…</div>` : ''}<div id="chat-end"></div></main>
+    <div class="composer"><button class="round" data-act="demoPhoto" aria-label="${t('demoPlayPhoto')}">${icon('camera')}</button><button class="round" data-act="demoVoice" aria-label="${t('demoPlayVoice')}">${icon('mic')}</button><input disabled placeholder="${t('typingLater')}" aria-label="${t('typingLater')}"><button class="round send" disabled aria-label="${t('send')}">${icon('send')}</button></div>`;
+}
+const DEMO = {
+  photo: async (key) => {
+    const opened = key === 'demoAns2' ? addDays(today(), -2) : null, exp = addDays(today(), 1), mfg = addDays(today(), -12);
+    const op = { ids: [], do: async () => { const c = await ensureCat('demoFood'); const made = await api.insert('items', { household_id: S.hh.id, category_id: c.id, name: t('demoSeoulMilk'), quantity: 1, unit: t('demoCarton'), date_type: 'expiration', printed_date: exp, manufactured_on: mfg, opened_on: opened }); op.ids = [made.id]; await load('items'); }, undo: async () => { for (const id of op.ids) await api.remove('items', id); await load('items'); } };
+    await op.do();
+    const m = await botSay(t(opened ? 'demoPhotoDone' : 'demoPhotoDoneClosed', { o: opened && fmtDate(opened), m: fmtDate(mfg), e: fmtDate(exp) }), { items: op.ids });
+    chatOps[m.id] = op;
+  },
+  voice: async () => {
+    const exp = addDays(today(), 7), yesterday = addDays(today(), -1);
+    const op = { ids: [], prev: null, do: async () => {
+      const food = await ensureCat('demoFood');
+      const milk = await api.insert('items', { household_id: S.hh.id, category_id: food.id, name: t('demoMilk'), quantity: 1, unit: t('demoCarton'), date_type: 'expiration', printed_date: exp, opened_on: today() });
+      let drops = S.items.find((i) => /^(eye\s*drops?|안약)$/i.test(i.name.trim()));
+      if (drops) { op.prev = { id: drops.id, opened_on: drops.opened_on }; await api.update('items', drops.id, { opened_on: yesterday }); op.ids = [milk.id]; }
+      else { const aid = await ensureCat('demoFirstAid'); drops = await api.insert('items', { household_id: S.hh.id, category_id: aid.id, name: t('demoEyeDrops'), quantity: 1, unit: t('demoBottle'), date_type: 'none', opened_on: yesterday }); op.prev = null; op.ids = [milk.id, drops.id]; }
+      op.shown = [milk.id, drops.id]; await load('items');
+    }, undo: async () => { for (const id of op.ids) await api.remove('items', id); if (op.prev) await api.update('items', op.prev.id, { opened_on: op.prev.opened_on }); await load('items'); } };
+    await op.do();
+    const m = await botSay(t(op.prev ? 'demoVoiceDoneUpdated' : 'demoVoiceDoneAdded', { e: fmtDate(exp), t: fmtDate(today()), y: fmtDate(yesterday) }), { items: op.shown });
+    chatOps[m.id] = op;
+  },
+};
 
 function vMore() {
   const guest = S.user?.is_anonymous;
   return `<main class="page">${top(t('home'))}${h1(t('more'), `${S.hh.name} · ${guest ? t('guestMode') : t('signedIn')}`)}
-    ${card(rowLink('#/shopping', t('shoppingList'), '', `<span class="muted small">${t('nToBuy', { n: S.shop.filter((x) => !x.checked).length })}</span>`))}
-    ${card(rowLink('#/reminders/default', t('defaultReminders'), esc(S.rules.filter((x) => !x.item_id).map(ruleSummary).join(' · ') || t('noReminders'))) + rowLink('#/categories', t('categories'), '', `<span class="muted small">${S.cats.length}</span>`) + rowLink('#/customize', t('homeScreen'), ''))}
+    ${card(rowLink('#/shopping', t('shoppingList'), '', `<span class="muted small">${t('nToBuy', { n: S.shop.filter((x) => !x.checked).length })}</span>`) + rowLink('#/archive', t('archive'), esc(t('archiveSub')), `<span class="muted small">${S.archive.length}</span>`))}
+    ${card(rowLink('#/reminders/default', t('defaultReminders'), esc(S.rules.filter((x) => !x.item_id).map(ruleSummary).join(' · ') || t('noReminders'))) + `<button class="row" data-act="scopeSetting"><span class="grow"><span class="row-t">${t('scopeSetting')}</span><span class="row-m">${t('scope_' + (S.scope || 'ask'))}</span></span></button>` + rowLink('#/categories', t('categories'), '', `<span class="muted small">${S.cats.length}</span>`) + rowLink('#/customize', t('homeScreen'), ''))}
     ${card(`<button class="row" data-act="rename"><span class="row-t">${t('homeName')}</span><span class="muted small">${esc(S.hh.name)}</span></button><button class="row" data-act="copyCode"><span class="grow"><span class="row-t">${t('familyCode')}</span><span class="row-m">${t('familyCodeSub')}</span></span><span class="link">${t('copy')}</span></button><button class="row" data-act="lang"><span class="row-t">${t('language')}</span><span class="muted small">${getLang() === 'en' ? 'English' : '한국어'}</span></button><button class="row" data-act="dateFmt"><span class="row-t">${t('dateFormat')}</span><span class="muted small">${fmtDate(today())}</span></button><button class="row" data-act="signOut"><span class="row-t danger">${t('signOut')}</span></button>`)}
     <p class="small muted center">${t('version')}</p></main>`;
 }
@@ -432,6 +491,12 @@ function vShopping() {
   return `<main class="page">${top(t('back'))}${h1(t('shoppingList'), t('shoppingSub'))}
     <form id="shop-form" class="inline" novalidate><div class="fl-wrap grow">${floating('name', t('addToBuy'), 'maxlength="120"')}</div><button class="btn pri">${t('add')}</button></form>
     ${open.length ? card(open.map(row).join('')) : empty(t('nothingToBuy'))}${done.length ? `<div class="h2"><h2>${t('bought')}</h2></div>${card(done.map(row).join(''))}` : ''}</main>`;
+}
+
+function vArchive() {
+  const why = (i) => t('arch_' + (i.archive_reason || 'used')) + (i.archived_at ? ' · ' + fmtDate(iso(new Date(i.archived_at))) : '');
+  return `<main class="page">${top(t('back'))}${h1(t('archive'), t('archiveSub'))}
+    ${S.archive.length ? S.archive.map((i) => `<div class="card pad"><div class="row bare"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${esc(catName(i.category_id))} · ${esc(why(i))}</span></span></div><div class="row-btns"><button class="btn line" data-act="restore" data-id="${i.id}">${t('restore')}</button><button class="btn soft danger-t" data-act="delForever" data-id="${i.id}">${t('deleteForever')}</button></div></div>`).join('') + `<button class="link danger center" data-act="emptyArchive">${t('emptyArchive')}</button>` : empty(t('archiveEmpty'))}</main>`;
 }
 
 function vCustomize() {
@@ -449,7 +514,7 @@ function vCategories() {
     <button class="btn dashed" data-act="newCat">${t('newCategory')}</button></main>`;
 }
 
-const VIEWS = { home: vHome, items: vItems, item: vItem, edit: vEdit, reminders: vReminders, alerts: vAlerts, assistant: vAssistant, more: vMore, shopping: vShopping, customize: vCustomize, categories: vCategories };
+const VIEWS = { archive: vArchive, home: vHome, items: vItems, item: vItem, edit: vEdit, reminders: vReminders, alerts: vAlerts, assistant: vAssistant, more: vMore, shopping: vShopping, customize: vCustomize, categories: vCategories };
 let lastRoute = '';
 function render() {
   const r = route();
@@ -476,14 +541,14 @@ function render() {
 
 // ---------- actions ----------
 const A = {
-  back,
+  back: () => { if (route().name !== 'reminders') return back(); run(async () => { await saveOpenRule(); await settleTemplate(); back(); }); },
   undo: () => { const u = S.undo; $('#toast').innerHTML = ''; S.undo = null; if (u) run(u); },
   lang: () => run(async () => { setLang(getLang() === 'en' ? 'ko' : 'en'); if (S.user) await api.saveSettings(S.user.id, { language: getLang() }).catch(() => {}); render(); }),
   guest: () => run(async () => { S.user = await api.signInGuest(); await start(); }),
   signOut: () => run(async () => {
     const guest = S.user?.is_anonymous;
     if (!(await ask({ title: t('signOutQ'), body: guest ? t('signOutGuestWarn') : '', ok: t('signOut'), danger: guest }))) return;
-    await api.signOut(); Object.assign(S, { user: null, hh: null, ready: false, items: [], cats: [], rules: [], shop: [], layout: DEFAULT_LAYOUT }); go('#/home'); render();
+    await api.signOut(); Object.assign(S, { user: null, hh: null, ready: false, items: [], archive: [], cats: [], rules: [], shop: [], layout: DEFAULT_LAYOUT, scope: null }); go('#/home'); render();
   }),
   filter: (d) => { S.filter = d.f; render(); },
   tip: (d, el) => { const p = el.closest('.field').querySelector('.tip'); p.hidden = !p.hidden; el.setAttribute('aria-expanded', String(!p.hidden)); },
@@ -496,9 +561,9 @@ const A = {
     if (when) await patchItem(i, { snoozed_until: when.toISOString() }, t('snoozeDone', { d: fmtDateTime(when) }));
   }),
   wake: (d) => run(async () => { await patchItem(item(d.id), { snoozed_until: null }, t('saved')); }),
-  usedOne: (d) => run(async () => { const i = item(d.id), q = num(i.quantity) - 1; if (q <= 0) return removeItem(i, t('usedUpDone', { name: i.name }), 'consumed', num(i.quantity)); await patchItem(i, { quantity: q }, t('usedOneDone', { name: i.name }), 'consumed', 1); }),
-  usedUp: (d) => run(async () => { const i = item(d.id); await removeItem(i, t('usedUpDone', { name: i.name }), 'consumed', num(i.quantity)); }),
-  threw: (d) => run(async () => { const i = item(d.id); await removeItem(i, t('threwDone', { name: i.name }), 'wasted', num(i.quantity)); }),
+  usedOne: (d) => run(async () => { const i = item(d.id), q = num(i.quantity) - 1; if (q <= 0) return archiveItem(i, t('usedUpDone', { name: i.name }), 'used', 'consumed', num(i.quantity)); await patchItem(i, { quantity: q }, t('usedOneDone', { name: i.name }), 'consumed', 1); }),
+  usedUp: (d) => run(async () => { const i = item(d.id); await archiveItem(i, t('usedUpDone', { name: i.name }), 'used', 'consumed', num(i.quantity)); }),
+  threw: (d) => run(async () => { const i = item(d.id); await archiveItem(i, t('threwDone', { name: i.name }), 'wasted', 'wasted', num(i.quantity)); }),
   openToday: (d) => run(async () => { const i = item(d.id); await patchItem(i, { opened_on: today() }, t('openedDone', { d: fmtDate(addDays(today(), i.after_opening_days)) }), 'opened', 0); }),
   openOther: (d) => run(async () => { const i = item(d.id); const v = await ask({ title: t('whenOpened'), input: fmtDate(today()), v: 'date', max: 'today', placeholder: datePlaceholder(), ok: t('save') }); const day = v && toIso(v); if (!day) return; await patchItem(i, { opened_on: day }, t('openedDone', { d: fmtDate(addDays(day, i.after_opening_days)) }), 'opened', 0); }),
   unopen: (d) => run(async () => { await patchItem(item(d.id), { opened_on: null }, t('markedUnopened')); }),
@@ -511,7 +576,20 @@ const A = {
     await load('shop'); render();
     toast(t('addedToShopping', { name: i.name }), async () => { await api.remove('shopping_entries', row.id); await load('shop'); render(); toast(t('undone')); });
   }),
-  delItem: (d) => run(async () => { const i = item(d.id); if (!(await ask({ title: t('deleteQ', { name: i.name }), ok: t('delete'), danger: true }))) return; await removeItem(i, t('deletedDone', { name: i.name })); }),
+  toArchive: (d) => run(async () => { const i = item(d.id); await archiveItem(i, t('archivedDone', { name: i.name }), 'removed'); }),
+  restore: (d) => run(async () => { const i = S.archive.find((x) => x.id === d.id); await api.update('items', i.id, { archived_at: null, archive_reason: null, quantity: num(i.quantity) > 0 ? num(i.quantity) : 1 }); await load('items'); render(); toast(t('restoredDone', { name: i.name })); }),
+  delForever: (d) => run(async () => {
+    const i = item(d.id) || S.archive.find((x) => x.id === d.id);
+    if (!(await ask({ title: t('deleteForeverQ', { name: i.name }), body: t('deleteForeverBody'), ok: t('deleteForever'), danger: true }))) return;
+    await api.remove('items', i.id); await load('items', 'rules');
+    if (route().name === 'item') back(); else render();
+    toast(t('deletedDone', { name: i.name }));
+  }),
+  emptyArchive: () => run(async () => {
+    if (!(await ask({ title: t('emptyArchiveQ', { n: S.archive.length }), body: t('deleteForeverBody'), ok: t('deleteForever'), danger: true }))) return;
+    for (const i of [...S.archive]) await api.remove('items', i.id);
+    await load('items', 'rules'); render(); toast(t('archiveEmptied'));
+  }),
   pickCat: (d) => { readForm(); S.draft.category_id = S.draft.category_id === d.id ? '' : d.id; render(); },
   toggleMore: () => { readForm(); S.more = !S.more; render(); },
   step: (d) => { readForm(); S.draft.quantity = String(Math.max(1, (Number(String(S.draft.quantity).replace(',', '.')) || 0) + Number(d.d))); render(); },
@@ -526,16 +604,38 @@ const A = {
   rename: () => run(async () => { const v = await ask({ title: t('homeName'), input: S.hh.name, ok: t('save') }); if (!v) return; await api.update('households', S.hh.id, { name: v.slice(0, 40) }); S.hh.name = v.slice(0, 40); render(); }),
   makeDefault: (d) => run(async () => {
     await saveOpenRule();
-    const { id, item_id, household_id, created_at, updated_at, ...rule } = S.rules.find((x) => x.id === d.id);
+    const src = S.rules.find((x) => x.id === d.id);
+    const { id, item_id, household_id, created_at, updated_at, template_id, applies_from, ...rule } = src;
     const same = (a) => Object.keys(rule).every((k) => String(a[k] ?? '') === String(rule[k] ?? ''));
     if (S.rules.some((x) => !x.item_id && same(x))) return toast(t('alreadyDefault'));
-    const made = await api.insert('reminder_rules', { ...rule, household_id, item_id: null });
+    let scope = S.scope;
+    if (!scope) {
+      scope = await choose({ title: t('scopeQ'), body: t('scopeBody'), remember: t('scopeRemember'), options: SCOPES.map((k) => ({ value: k, label: t('scope_' + k) })) });
+      if (!scope) return;
+      if (choose.remembered) { S.scope = scope; api.saveSettings(S.user.id, { template_scope: scope }).catch(() => {}); }
+    }
+    const made = await api.insert('reminder_rules', { ...rule, household_id, item_id: null, applies_from: scope === 'new' ? new Date().toISOString() : null });
+    await api.update('reminder_rules', src.id, { template_id: made.id });
+    const copies = [];
+    if (scope === 'all') for (const i of S.items) { if (i.id !== item_id && ownRules(i).length && !ownRules(i).some(same)) copies.push(await api.insert('reminder_rules', { ...rule, household_id, item_id: i.id, template_id: made.id })); }
     await load('rules'); render();
-    toast(t('madeDefault'), async () => { await api.remove('reminder_rules', made.id); await load('rules'); render(); toast(t('undone')); });
+    toast(t('madeDefault_' + scope, { n: copies.length }), async () => { for (const c of copies) await api.remove('reminder_rules', c.id); await api.update('reminder_rules', src.id, { template_id: null }); await api.remove('reminder_rules', made.id); await load('rules'); render(); toast(t('undone')); });
   }),
+  scopeSetting: () => run(async () => {
+    const v = await choose({ title: t('scopeSetting'), body: t('scopeBody'), options: [{ value: 'ask', label: t('scope_ask'), on: !S.scope }, ...SCOPES.map((k) => ({ value: k, label: t('scope_' + k), on: S.scope === k }))] });
+    if (!v) return;
+    S.scope = v === 'ask' ? null : v; render();
+    await api.saveSettings(S.user.id, { template_scope: S.scope });
+  }),
+  demoPhoto: () => run(async () => { if (S.typing || S.chat.some((m) => m.replies && !m.answered)) return; say('user', t('demoPhotoUser'), { photo: true }); await botSay(t('demoPhotoQ', { m: fmtDate(addDays(today(), -12)), e: fmtDate(addDays(today(), 1)) }), { replies: ['demoAns2', 'demoAnsNo'] }); }),
+  demoReply: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)); if (!m || m.answered) return; m.answered = true; say('user', t(d.key)); await DEMO.photo(d.key); }),
+  demoVoice: () => run(async () => { if (S.typing) return; say('user', t('demoVoiceUser', { e: fmtDate(addDays(today(), 7)) }), { voice: true }); await DEMO.voice(); }),
+  chatUndo: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)); await chatOps[m.id].undo(); m.undone = true; await botSay(t('demoUndone'), { redoOf: m.id }); }),
+  chatRedo: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)), orig = S.chat.find((x) => x.id === m.redoOf), op = chatOps[orig.id]; m.redone = true; await op.do(); const again = await botSay(t('demoRedone'), { items: op.shown || op.ids }); chatOps[again.id] = op; }),
+  clearChat: () => { S.chat = []; render(); },
   copyCode: () => run(async () => { try { await navigator.clipboard.writeText(S.hh.join_code); toast(t('codeCopied')); } catch { await ask({ title: t('familyCode'), body: S.hh.join_code, ok: t('ok') }); } }),
-  openRule: (d) => run(async () => { await saveOpenRule(); S.openRule = d.id ? await ownRule(d.id) : null; render(); }),
-  addRule: (d) => run(async () => { await saveOpenRule(); await ownRule(null); const row = await api.insert('reminder_rules', { household_id: S.hh.id, item_id: d.id === 'default' ? null : d.id, anchor: 'due', offset_amount: 1, offset_unit: 'days', at_time: '09:00' }); await load('rules'); S.openRule = row.id; render(); }),
+  openRule: (d) => run(async () => { await saveOpenRule(); await settleTemplate(); S.openRule = d.id ? await ownRule(d.id) : null; render(); }),
+  addRule: (d) => run(async () => { await saveOpenRule(); await settleTemplate(); await ownRule(null); const row = await api.insert('reminder_rules', { household_id: S.hh.id, item_id: d.id === 'default' ? null : d.id, anchor: 'due', offset_amount: 1, offset_unit: 'days', at_time: '09:00' }); await load('rules'); S.openRule = row.id; render(); }),
   delRule: (d) => run(async () => { d = { id: await ownRule(d.id) }; const { created_at, updated_at, ...row } = S.rules.find((x) => x.id === d.id); await api.remove('reminder_rules', d.id); S.openRule = null; await load('rules'); render(); toast(t('reminderDeleted'), async () => { await api.insert('reminder_rules', row); await load('rules'); render(); toast(t('undone')); }); }),
   useDefaults: (d) => run(async () => { if (!(await ask({ title: t('backToDefaultsQ'), ok: t('ok') }))) return; for (const x of S.rules.filter((r) => r.item_id === d.id)) await api.remove('reminder_rules', x.id); S.openRule = null; await load('rules'); render(); }),
   delShop: (d) => run(async () => { await api.remove('shopping_entries', d.id); await load('shop'); render(); }),
@@ -548,7 +648,7 @@ async function ownRule(ruleId) {
   const r = route();
   if (r.name !== 'reminders' || r.id === 'default' || S.rules.some((x) => x.item_id === r.id)) return ruleId;
   let mine = ruleId;
-  for (const { id, created_at, updated_at, ...x } of S.rules.filter((y) => !y.item_id)) { const made = await api.insert('reminder_rules', { ...x, item_id: r.id }); if (id === ruleId) mine = made.id; }
+  for (const { id, created_at, updated_at, applies_from, template_id, ...x } of defaultsFor(item(r.id))) { const made = await api.insert('reminder_rules', { ...x, item_id: r.id }); if (id === ruleId) mine = made.id; }
   await load('rules');
   return mine;
 }
@@ -579,6 +679,22 @@ async function saveOpenRule() {
   } else Object.assign(patch, { repeat_every_amount: null, repeat_every_unit: null, repeat_count: null });
   if (Object.keys(patch).every((k) => String(patch[k] ?? '') === String(k === 'at_time' ? x[k]?.slice(0, 5) : x[k] ?? ''))) return;
   await api.update('reminder_rules', x.id, patch);
+  await load('rules');
+  if (x.template_id && S.rules.some((y) => y.id === x.template_id)) S.pendingTpl = x.id;
+}
+// A reminder that was made a default has been edited: ask once, when its box is closed, whether the default
+// (and the copies other items got from it) should change as well.
+const RULE_FIELDS = ['anchor', 'offset_amount', 'offset_unit', 'at_time', 'fixed_at', 'repeat_every_amount', 'repeat_every_unit', 'repeat_count'];
+async function settleTemplate() {
+  const x = S.rules.find((r) => r.id === S.pendingTpl);
+  S.pendingTpl = null;
+  const tpl = x && S.rules.find((r) => r.id === x.template_id);
+  if (!tpl || RULE_FIELDS.every((k) => String(tpl[k] ?? '') === String(x[k] ?? ''))) return;
+  const others = S.rules.filter((r) => r.template_id === tpl.id && r.id !== x.id);
+  const yes = await ask({ title: t('tplChangeQ'), body: t('tplChangeBody', { n: others.length }), ok: t('tplChangeYes'), cancel: t('tplChangeNo') });
+  const patch = Object.fromEntries(RULE_FIELDS.map((k) => [k, x[k]]));
+  if (yes) { for (const r of [tpl, ...others]) await api.update('reminder_rules', r.id, patch); toast(t('tplChanged')); }
+  else await api.update('reminder_rules', x.id, { template_id: null }); // from now on this one is separate from the default
   await load('rules');
 }
 
@@ -647,7 +763,7 @@ async function toggleShop(id, checked) {
     // An item that only exists because of this tick (made after the entry, nothing else filled in) is removed again.
     const bornHere = i && i.created_at > x.created_at && !i.due_date && !i.category_id && !i.notes && num(i.quantity) <= n;
     if (bornHere) { await api.update('shopping_entries', id, { checked: false, item_id: null }); await api.remove('items', i.id); }
-    else if (i && num(i.quantity) - n <= 0) { await api.update('shopping_entries', id, { checked: false, item_id: null }); await api.remove('items', i.id); }
+    else if (i && num(i.quantity) - n <= 0) { await api.update('shopping_entries', id, { checked: false }); await api.update('items', i.id, { archived_at: new Date().toISOString(), archive_reason: 'used' }); }
     else { if (i) await api.update('items', i.id, { quantity: num(i.quantity) - n }); await api.update('shopping_entries', id, { checked: false }); }
   }
   await load('items', 'shop'); render();
@@ -655,7 +771,7 @@ async function toggleShop(id, checked) {
 document.addEventListener('focusout', (e) => { if (e.target.dataset?.v) check(e.target, true); });
 // A snoozed reminder comes back on its own: redraw the two overview screens once a minute, never while something is being typed.
 setInterval(() => { if (S.ready && ['home', 'alerts'].includes(route().name) && !$('#modal').innerHTML && document.activeElement?.tagName !== 'INPUT') render(); }, 60000);
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => { render(); if (S.pendingTpl) run(async () => { await settleTemplate(); render(); }); });
 window.addEventListener('online', () => { $('#offline').hidden = true; });
 window.addEventListener('offline', () => { $('#offline').hidden = false; });
 
@@ -665,6 +781,7 @@ async function start() {
   const st = await api.settings(S.user.id).catch(() => null);
   if (st?.language && st.language !== getLang()) setLang(st.language);
   if (st?.date_format) setDateFormat(st.date_format);
+  S.scope = st?.template_scope || null;
   S.ready = true; render();
 }
 (async () => {
