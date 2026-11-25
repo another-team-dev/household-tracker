@@ -59,3 +59,27 @@ Found by reading the code path of each use case; not yet reproduced in the runni
 | O1 | Only one step of undo. | A new action replaces the previous undo record. |
 | O2 | Saving settings in English stores "My home" as a custom name. | `settings_` drops the `defaultName` flag. |
 | O3 | AI-created items fail when the model sends `null` for the reminder. | `number_(null)` is rejected in `normalizeItem_`. |
+
+## Live test, 25 Nov 2026
+
+Run in the deployed web app under a separate test ID (`qa-claude`), in English, on a desktop browser.
+The test ID uses up one of the 40 inventories (see A2) and still holds two test items.
+
+| Check | Result |
+|---|---|
+| R3: save an item with "Usable after opening" = 90 and no opening date | **Confirmed.** Refused with "Enter an opening date to set a period after opening." The message appears below the Cancel button, at the very bottom of a long form. |
+| R1a: add an item dated seven months ahead, then look at Home | **Confirmed.** Toast says "Item added", Home still says "0 items" and "Nothing to check right now". |
+| R1b: tap the "due" card on Home, go back to Home, open List | **Confirmed.** List opens with the "Due soon" filter still on and says "0 items · No items yet", although one item exists. Tapping "All" shows it. |
+| R2: reminder setting | **Confirmed.** One number field, "How many days ahead should we remind you?". |
+| S2: add "Test tea" to the shopping list, tick it, un-tick it | **Confirmed.** The item created by the tick stays in the inventory with quantity 0 and shows under "Running low". |
+
+### New findings
+
+| # | Problem | Detail |
+|---|---|---|
+| L1 | The live assistant does not work in this deployment. | Profile shows "Gemini API key missing"; a typed message gets "The Gemini API key is missing. You can still try a demo or add an item manually." Only the scripted demo works. |
+| L2 | A typed date can turn into a wrong year. | Typing `20270630` into the date field gives year `202706` (the year part accepts six digits), so the date is incomplete until corrected by hand. |
+| L3 | The "purchased" control on a shopping entry is a clock icon with no label. | It is not obvious that tapping it marks the entry as bought. |
+| L4 | The browser on this computer was already signed in to a shared demo ID (`report_demo_02`). | Anyone opening the link there lands in that inventory without being asked; IDs are remembered per browser with no sign-out prompt. |
+
+Not re-tested live: A1–A4, I1–I7, S1, S3, N1–N3, O1–O3 (still based on reading the code).
