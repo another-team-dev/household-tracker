@@ -101,6 +101,7 @@ with sync_playwright() as p:
     pg.click('button:has-text("Delete forever")'); pg.click('#ask-form button[type=submit]'); pg.wait_for_selector('text=The archive is empty'); ok(True, 'confirmed "Delete forever" removes it')
     # assistant demo
     go(pg, '#/assistant', 'text=Play the photo example'); pg.click('text=Play the photo example'); pg.wait_for_selector('text=When did you open it?'); pg.click('text=I opened it two days ago'); pg.wait_for_selector('text=View Seoul Milk')
+    ok(pg.locator('.bub-acts button:has-text("Undo")').count() == 1, 'the assistant answer carries an Undo button straight away')
     go(pg, '#/items/all', '.chips'); ok(pg.locator('#results a.row:has-text("Seoul Milk")').count() == 1, 'photo demo adds a real item after the follow-up question')
     go(pg, '#/assistant', 'text=View Seoul Milk'); pg.click('.bub-acts button:has-text("Undo")'); pg.wait_for_selector('text=Add them back'); ok('#/assistant' in pg.url and pg.locator('text=View Seoul Milk').count() == 0, 'Undo stays in the chat and the assistant says what it undid')
     pg.click('.composer [data-act=demoVoice]'); pg.wait_for_selector('text=View Eye drops'); go(pg, '#/items/all', '.chips'); ok(pg.locator('#results a.row:has-text("Eye drops")').count() == 1 and pg.locator('#results a.row:has-text("Milk")').count() == 2, 'voice demo adds milk and eye drops')

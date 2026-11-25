@@ -458,7 +458,7 @@ const DEMO = {
     const op = { ids: [], do: async () => { const c = await ensureCat('demoFood'); const made = await api.insert('items', { household_id: S.hh.id, category_id: c.id, name: t('demoSeoulMilk'), quantity: 1, unit: t('demoCarton'), date_type: 'expiration', printed_date: exp, manufactured_on: mfg, opened_on: opened }); op.ids = [made.id]; await load('items'); }, undo: async () => { for (const id of op.ids) await api.remove('items', id); await load('items'); } };
     await op.do();
     const m = await botSay(t(opened ? 'demoPhotoDone' : 'demoPhotoDoneClosed', { o: opened && fmtDate(opened), m: fmtDate(mfg), e: fmtDate(exp) }), { items: op.ids });
-    chatOps[m.id] = op;
+    chatOps[m.id] = op; drawChat();
   },
   voice: async () => {
     const exp = addDays(today(), 7), yesterday = addDays(today(), -1);
@@ -472,7 +472,7 @@ const DEMO = {
     }, undo: async () => { for (const id of op.ids) await api.remove('items', id); if (op.prev) await api.update('items', op.prev.id, { opened_on: op.prev.opened_on }); await load('items'); } };
     await op.do();
     const m = await botSay(t(op.prev ? 'demoVoiceDoneUpdated' : 'demoVoiceDoneAdded', { e: fmtDate(exp), t: fmtDate(today()), y: fmtDate(yesterday) }), { items: op.shown });
-    chatOps[m.id] = op;
+    chatOps[m.id] = op; drawChat();
   },
 };
 
@@ -631,7 +631,7 @@ const A = {
   demoReply: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)); if (!m || m.answered) return; m.answered = true; say('user', t(d.key)); await DEMO.photo(d.key); }),
   demoVoice: () => run(async () => { if (S.typing) return; say('user', t('demoVoiceUser', { e: fmtDate(addDays(today(), 7)) }), { voice: true }); await DEMO.voice(); }),
   chatUndo: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)); await chatOps[m.id].undo(); m.undone = true; await botSay(t('demoUndone'), { redoOf: m.id }); }),
-  chatRedo: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)), orig = S.chat.find((x) => x.id === m.redoOf), op = chatOps[orig.id]; m.redone = true; await op.do(); const again = await botSay(t('demoRedone'), { items: op.shown || op.ids }); chatOps[again.id] = op; }),
+  chatRedo: (d) => run(async () => { const m = S.chat.find((x) => x.id === Number(d.id)), orig = S.chat.find((x) => x.id === m.redoOf), op = chatOps[orig.id]; m.redone = true; await op.do(); const again = await botSay(t('demoRedone'), { items: op.shown || op.ids }); chatOps[again.id] = op; drawChat(); }),
   clearChat: () => { S.chat = []; render(); },
   copyCode: () => run(async () => { try { await navigator.clipboard.writeText(S.hh.join_code); toast(t('codeCopied')); } catch { await ask({ title: t('familyCode'), body: S.hh.join_code, ok: t('ok') }); } }),
   openRule: (d) => run(async () => { await saveOpenRule(); await settleTemplate(); S.openRule = d.id ? await ownRule(d.id) : null; render(); }),
