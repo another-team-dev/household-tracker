@@ -1,4 +1,4 @@
-import { t, setLang, getLang, fmtDate, fmtDateTime } from './i18n.js';
+import { t, setLang, getLang, fmtDate, fmtDateTime, dateState, maskDate, datePlaceholder, getDateFormat, setDateFormat, DATE_FORMATS } from './i18n.js';
 import { createApi } from './api.js';
 
 const SOON_DAYS = 7; // "needs attention" window; deliberately independent of reminder settings
@@ -28,7 +28,9 @@ function info(i) {
   const status = num(i.quantity) === 0 ? 'empty' : left === null ? 'nodate' : left < 0 ? 'expired' : left <= SOON_DAYS ? 'soon' : 'ok';
   return { left, status };
 }
-const needsAttention = (i) => ['expired', 'soon'].includes(info(i).status);
+const snoozed = (i) => !!i.snoozed_until && new Date(i.snoozed_until) > new Date();
+const dueSoon = (i) => ['expired', 'soon'].includes(info(i).status);
+const needsAttention = (i) => dueSoon(i) && !snoozed(i);
 function pill(i) {
   const { left, status } = info(i);
   if (status === 'nodate') return `<span class="muted small">${t('noDate')}</span>`;
@@ -82,16 +84,64 @@ function friendly(e) {
   return t('errGeneric') + ' (' + m.slice(0, 120) + ')';
 }
 // Small in-page dialog: resolves to true / the typed text, or null when cancelled.
-function ask({ title, body = '', input = null, ok = t('ok'), danger = false, type = 'text' }) {
+function ask({ title, body = '', input = null, ok = t('ok'), danger = false, v = '', max = '', placeholder = '' }) {
   return new Promise((resolve) => {
-    const field = input === null ? '' : `<input id="ask-input" type="${type}" value="${esc(input)}" ${type === 'date' ? `max="${today()}" min="2000-01-01"` : 'maxlength="60"'} aria-label="${esc(title)}">`;
-    $('#modal').innerHTML = `<div class="backdrop"><form class="sheet" id="ask-form"><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${field}<div class="row-btns"><button type="button" class="btn soft" data-ask="cancel">${t('cancel')}</button><button type="submit" class="btn ${danger ? 'danger' : 'pri'}">${esc(ok)}</button></div></form></div>`;
-    const done = (v) => { $('#modal').innerHTML = ''; resolve(v); };
-    $('#ask-form').addEventListener('submit', (e) => { e.preventDefault(); const v = input === null ? true : $('#ask-input').value.trim(); done(input !== null && !v ? null : v); });
+    const field = input === null ? '' : `<div class="field"><input id="ask-input" value="${esc(input)}" ${v ? `data-v="${v}"` : ''} ${max ? `data-max="${max}"` : ''} ${v === 'date' || v === 'days' ? 'inputmode="numeric"' : ''} placeholder="${esc(placeholder)}" maxlength="60" autocomplete="off" aria-label="${esc(title)}"><p class="msg" role="alert"></p></div>`;
+    $('#modal').innerHTML = `<div class="backdrop"><form class="sheet" id="ask-form" novalidate><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${field}<div class="row-btns"><button type="button" class="btn soft" data-ask="cancel">${t('cancel')}</button><button type="submit" class="btn ${danger ? 'danger' : 'pri'}">${esc(ok)}</button></div></form></div>`;
+    const done = (val) => { $('#modal').innerHTML = ''; resolve(val); };
+    $('#ask-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (input === null) return done(true);
+      const el = $('#ask-input'), val = el.value.trim();
+      if (!val) { mark(el, t('errEmpty')); return el.focus(); }
+      if (v && check(el, true)) return el.focus(); // stays open, the wrong value stays visible and red
+      done(val);
+    });
     $('#modal').querySelector('[data-ask]').addEventListener('click', () => done(null));
     (input === null ? $('#ask-form button[type=submit]') : $('#ask-input')).focus();
   });
 }
+// A short list of choices; resolves to the chosen value or null.
+function choose({ title, body = '', options }) {
+  return new Promise((resolve) => {
+    $('#modal').innerHTML = `<div class="backdrop"><div class="sheet" role="dialog" aria-label="${esc(title)}"><h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ''}${options.map((o, n) => `<button class="btn ${o.on ? 'pri' : 'line'}" data-choice="${n}">${esc(o.label)}</button>`).join('')}<button class="btn soft" data-choice="-1">${t('cancel')}</button></div></div>`;
+    $('#modal').querySelectorAll('[data-choice]').forEach((b) => b.addEventListener('click', () => { $('#modal').innerHTML = ''; resolve(options[b.dataset.choice]?.value ?? null); }));
+    $('#modal').querySelector('[data-choice]').focus();
+  });
+}
+
+// ---------- checking what is typed ----------
+// Runs while typing (final = false: only what is already certainly wrong) and when leaving the field or saving (final = true).
+// A wrong value is never cleared: the field turns red and says what is expected.
+function check(el, final = false) {
+  const val = el.value.trim(), kind = el.dataset.v;
+  let m = '';
+  if (kind === 'name') { if (final && !val) m = t('errName'); }
+  else if (kind === 'qty') {
+    const n = Number(val.replace(',', '.'));
+    if (/[^\d.,]/.test(val)) m = t('errQuantity');
+    else if (final && (val === '' || !Number.isFinite(n) || n <= 0 || n > 99999)) m = t('errQuantity');
+  } else if (kind === 'days') {
+    if (/\D/.test(val) || Number(val) > 3650) m = t('errDays');
+    else if (final && val !== '' && Number(val) < 1) m = t('errDays');
+  } else if (kind === 'code') {
+    if (/[^0-9a-f]/i.test(val) || val.length > 18) m = t('errCodeFormat');
+    else if (final && val.length !== 18) m = t('errCodeFormat');
+  } else if (kind === 'date' && val) {
+    const st = dateState(val);
+    if (st.state === 'bad') m = t('errDateLive', { f: datePlaceholder() });
+    else if (st.state === 'partial') { if (final) m = t('errDateIncomplete', { f: datePlaceholder() }); }
+    else if (el.dataset.max === 'today' && st.iso > today()) m = t('errFutureOpen');
+  }
+  mark(el, m);
+  return m;
+}
+function mark(el, m) {
+  el.setAttribute('aria-invalid', m ? 'true' : 'false');
+  const p = el.closest('.field, .fl-wrap')?.querySelector('.msg');
+  if (p) p.textContent = m;
+}
+const toIso = (text) => { const st = dateState(String(text || '').trim()); return st.state === 'ok' ? st.iso : null; };
 
 // ---------- data ----------
 async function load(...tables) {
@@ -99,6 +149,8 @@ async function load(...tables) {
   const keys = tables.length ? tables : Object.keys(map);
   const rows = await Promise.all(keys.map((k) => api.select(map[k], S.hh.id)));
   keys.forEach((k, n) => { S[k] = rows[n]; });
+  // Nothing with quantity 0 is kept or counted: an item that is used up leaves the inventory.
+  S.items = S.items.filter((i) => num(i.quantity) > 0);
   S.cats.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
 }
 async function enter() {
@@ -121,12 +173,23 @@ async function patchItem(i, patch, message, kind, amount) {
   toast(message, async () => { await api.update('items', i.id, before); await load('items'); render(); toast(t('undone')); });
 }
 
+// Take an item out of the inventory and offer Undo that puts it back with its reminders.
+async function removeItem(i, message, kind, amount) {
+  const rules = S.rules.filter((x) => x.item_id === i.id);
+  await api.remove('items', i.id);
+  if (kind) api.insert('activity_log', { household_id: S.hh.id, item_name: i.name, kind, quantity: amount, unit: i.unit || '' }).catch(() => {});
+  await load('items', 'rules');
+  if (route().name === 'item' && route().id === i.id) back(); else render();
+  const { due_date, created_at, updated_at, ...row } = i;
+  toast(message, async () => { await api.insert('items', row); for (const { created_at: c, updated_at: u, ...x } of rules) await api.insert('reminder_rules', x); await load('items', 'rules'); render(); toast(t('undone')); });
+}
+
 // ---------- views ----------
 const icon = (name, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
 const ICONS = {
   back: 'm14 5-7 7 7 7', plus: 'M12 5v14M5 12h14', close: 'M6 6l12 12M6 18 18 6', search: 'M20 20l-5-5M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z',
   more: 'M5 12h.01M12 12h.01M19 12h.01', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4', spark: 'm12 3 3 6 6 3-6 3-3 6-3-6-6-3 6-3Z',
-  home: 'M3 10 12 3l9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z', down: 'm6 9 6 6 6-6', up: 'm6 15 6-6 6 6',
+  home: 'M3 10 12 3l9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z', cal: 'M4 6h16v15H4ZM4 10h16M8 3v5M16 3v5', down: 'm6 9 6 6 6-6', up: 'm6 15 6-6 6 6',
 };
 const top = (label, right = '') => `<div class="top"><button class="link backlink" data-act="back">${icon('back')}${esc(label)}</button>${right}</div>`;
 const h1 = (title, sub = '') => `<div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ''}</div>`;
@@ -145,9 +208,13 @@ function vWelcome() {
   return `<main class="page welcome"><h1 class="brand">${t('appName')}</h1><p class="sub center">${t('tagline')}</p>
     <button class="btn pri big" data-act="guest">${t('startGuest')}</button>
     <p class="small muted center">${t('guestNote')}</p>
-    <form id="join-form" class="join"><label for="code">${t('haveCode')}</label><div class="inline"><input id="code" name="code" autocomplete="off" placeholder="${t('codePlaceholder')}" maxlength="40" required><button class="btn line">${t('join')}</button></div></form>
+    <form id="join-form" class="join field" novalidate><div class="lab-row"><span>${t('haveCode')}</span>${infoBtn()}</div><p class="tip" hidden>${t('tip_code')}</p>
+      <div class="inline start"><div class="fl-wrap grow">${floating('code', t('codePlaceholder'), 'data-v="code" maxlength="24" autocapitalize="off" spellcheck="false"')}<p class="msg" role="alert"></p></div><button class="btn line">${t('join')}</button></div></form>
     <button class="link center" data-act="lang">${getLang() === 'en' ? '한국어' : 'English'}</button></main>`;
 }
+// Input whose label starts inside the box and moves up onto its top edge once you type, so it never disappears.
+const floating = (name, label, attrs = '') => `<label class="fl"><input name="${name}" placeholder=" " autocomplete="off" ${attrs}><span>${esc(label)}</span></label>`;
+const infoBtn = () => `<button type="button" class="info" data-act="tip" aria-expanded="false" aria-label="${t('tipWhat')}">i</button>`;
 
 const SECTION_VIEW = {
   attention() {
@@ -160,7 +227,7 @@ const SECTION_VIEW = {
       return `<a class="tile ${dark}" href="${href}"><span class="tile-n">${esc(name)}</span><span class="tile-m">${t('nItems', { n: list.length })}${due ? `<br><b class="warn">${t('nDue', { n: due })}</b>` : ''}</span></a>`;
     };
     const uncategorized = S.items.filter((i) => !i.category_id);
-    return `<section><div class="h2"><h2>${t('categories')}</h2><a class="link" href="#/categories">${t('edit')}</a></div><div class="tiles">${tile('#/items/all', t('allItems'), S.items, 'dark')}${S.cats.map((c) => tile(`#/items/${c.id}`, c.name, S.items.filter((i) => i.category_id === c.id))).join('')}${uncategorized.length ? tile('#/items/none', t('uncategorized'), uncategorized) : ''}<button class="tile add" data-act="newCat">${t('newCategory')}</button></div></section>`;
+    return `<section><div class="h2"><h2>${t('categories')}</h2><a class="link" href="#/categories">${t('edit')}</a></div><div class="tiles">${tile('#/items/all', t('allItems'), S.items, 'all')}${S.cats.map((c) => tile(`#/items/${c.id}`, c.name, S.items.filter((i) => i.category_id === c.id))).join('')}${uncategorized.length ? tile('#/items/none', t('uncategorized'), uncategorized) : ''}<button class="tile add" data-act="newCat">${t('newCategory')}</button></div></section>`;
   },
   recent() {
     const list = [...S.items].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 3);
@@ -171,7 +238,7 @@ const SECTION_VIEW = {
     return `<section><div class="h2"><h2>${t('shoppingList')}</h2><a class="link" href="#/shopping">${t('open')}</a></div>${list.length ? card(list.slice(0, 3).map((x) => `<div class="row"><span class="row-t">${esc(x.name)}</span><span class="muted small">${num(x.quantity)} ${esc(x.unit)}</span></div>`).join('')) : empty(t('nothingToBuy'))}</section>`;
   },
   low() {
-    const list = S.items.filter((i) => i.running_out || num(i.quantity) === 0);
+    const list = S.items.filter((i) => i.running_out);
     return `<section><div class="h2"><h2>${t('runningLow')}</h2></div>${list.length ? card(list.slice(0, 3).map((i) => itemRow(i)).join('')) : empty(t('nothingLow'))}</section>`;
   },
 };
@@ -181,6 +248,7 @@ function vHome() {
   const sections = S.layout.order.filter((x) => !S.layout.hidden.includes(x)).map((x) => SECTION_VIEW[x]()).join('');
   return `<main class="page with-nav"><div class="top"><div><p class="sub">${esc(date)}</p><h1>${esc(S.hh.name)}</h1><p class="sub">${t('totalItems', { n: S.items.length, c: S.cats.length })}</p></div><div class="inline"><a class="round" href="#/items/all?focus=1" aria-label="${t('search')}">${icon('search')}</a><a class="round" href="#/more" aria-label="${t('more')}">${icon('more', 'bold')}</a></div></div>
     <a class="assist-card" href="#/assistant"><span class="assist-h">${icon('spark')}${t('assistCard')}</span><span class="assist-in">${t('assistExample')}</span></a>
+    <a class="btn line" href="#/edit/new">${icon('plus')}${t('addManuallyBtn')}</a>
     ${sections}<a class="link center" href="#/customize">${t('customizeHome')}</a></main>${nav('home')}`;
 }
 
@@ -191,7 +259,7 @@ function listFor(id) {
   if (q) list = list.filter((i) => [i.name, catName(i.category_id), i.location, i.notes].join(' ').toLowerCase().includes(q));
   else if (id === 'none') list = list.filter((i) => !i.category_id);
   else if (id !== 'all') list = list.filter((i) => i.category_id === id);
-  const f = { all: () => true, soon: needsAttention, opened: (i) => !!i.opened_on, low: (i) => i.running_out || num(i.quantity) === 0, nodate: (i) => !i.due_date }[S.filter];
+  const f = { all: () => true, soon: needsAttention, opened: (i) => !!i.opened_on, low: (i) => i.running_out, nodate: (i) => !i.due_date }[S.filter];
   return { base: list, shown: list.filter(f).sort(urgency) };
 }
 function resultsHtml(id) {
@@ -202,13 +270,13 @@ function resultsHtml(id) {
 function expandedRow(i) {
   return `<div class="row col"><a class="row bare" href="#/item/${i.id}"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${meta(i)}</span></span>${pill(i)}</a>${quickBtns(i)}</div>`;
 }
-const quickBtns = (i) => `<div class="row-btns"><button class="btn line" data-act="usedOne" data-id="${i.id}" ${num(i.quantity) ? '' : 'disabled'}>${t('usedOne')}</button><button class="btn line" data-act="usedUp" data-id="${i.id}" ${num(i.quantity) ? '' : 'disabled'}>${t('usedUp')}</button><button class="btn line" data-act="threw" data-id="${i.id}" ${num(i.quantity) ? '' : 'disabled'}>${t('threwAway')}</button></div>`;
+const quickBtns = (i) => `<div class="row-btns"><button class="btn line" data-act="usedOne" data-id="${i.id}">${t('usedOne')}</button><button class="btn line" data-act="usedUp" data-id="${i.id}">${t('usedUp')}</button><button class="btn line" data-act="threw" data-id="${i.id}">${t('threwAway')}</button></div>`;
 
 function vItems(r) {
   const id = r.id || 'all';
   const { base } = listFor(id);
   const count = (key, fn) => base.filter(fn).length;
-  const chips = [['all', t('fAll'), base.length], ['soon', t('fSoon'), count('soon', needsAttention)], ['opened', t('fOpened'), count('o', (i) => !!i.opened_on)], ['low', t('fLow'), count('l', (i) => i.running_out || num(i.quantity) === 0)], ['nodate', t('fNoDate'), count('n', (i) => !i.due_date)]];
+  const chips = [['all', t('fAll'), base.length], ['soon', t('fSoon'), count('soon', needsAttention)], ['opened', t('fOpened'), count('o', (i) => !!i.opened_on)], ['low', t('fLow'), count('l', (i) => i.running_out)], ['nodate', t('fNoDate'), count('n', (i) => !i.due_date)]];
   const title = S.q ? t('searchResults') : id === 'all' ? t('allItems') : id === 'none' ? t('uncategorized') : catName(id);
   return `<main class="page with-nav with-fab">${top(t('home'))}${h1(title, S.q ? t('searchingAll') : t('sortedByDue', { n: base.length }))}
     <label class="search">${icon('search')}<input id="search" type="search" value="${esc(S.q)}" placeholder="${t('searchPlaceholder')}" aria-label="${t('search')}"></label>
@@ -223,7 +291,7 @@ function vItem(r) {
   const kv = (k, v) => `<div class="kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`;
   const openBlock = i.after_opening_days
     ? (i.opened_on
-      ? `${kv(t('opened'), fmtDate(i.opened_on))}<p class="small muted">${t('useBy', { d: fmtDate(addDays(i.opened_on, i.after_opening_days)) })}</p><button class="link" data-act="unopen" data-id="${i.id}">${t('notOpenedYet')}</button>`
+      ? `${kv(t('opened'), fmtDate(i.opened_on))}<p class="small muted">${t('useBy', { d: fmtDate(i.due_date) })}</p><button class="btn soft" data-act="unopen" data-id="${i.id}">${t('clearOpened')}</button>`
       : `${kv(t('opened'), t('notYet'))}<p class="q">${t('haveYouOpened')}</p><div class="row-btns"><button class="btn pri" data-act="openToday" data-id="${i.id}">${t('openedToday')}</button><button class="btn line" data-act="openOther" data-id="${i.id}">${t('anotherDate')}</button></div><p class="small muted">${t('ifOpenedToday', { d: fmtDate(addDays(today(), i.after_opening_days)) })}</p>`)
     : `<button class="link" data-act="setPao" data-id="${i.id}">${t('addAfterOpening')}</button>`;
   const own = S.rules.filter((x) => x.item_id === i.id);
@@ -232,41 +300,52 @@ function vItem(r) {
     <div class="card pad">${i.date_type !== 'none' ? kv(t('dt_' + i.date_type), i.printed_date ? fmtDate(i.printed_date) + (i.estimated ? ` (${t('estimated')})` : '') : t('notSet')) : kv(t('date'), t('noDate'))}${i.after_opening_days ? kv(t('afterOpening'), t('withinDays', { n: i.after_opening_days })) : ''}${openBlock}</div>
     ${quickBtns(i)}
     ${i.interval_days ? `<button class="btn line" data-act="replaced" data-id="${i.id}">${t('replacedToday', { n: i.interval_days })}</button>` : ''}
-    ${card(rowLink(`#/reminders/${i.id}`, t('remindersN', { n: own.length || S.rules.filter((x) => !x.item_id).length }), esc(own.length ? own.map(ruleSummary).join(' · ') : t('usingDefaults')), `<span class="link">${t('change')}</span>`)
-      + `<button class="row" data-act="toShop" data-id="${i.id}"><span class="row-t">${t('addToShopping')}</span><span class="link">${t('add')}</span></button>`)}
+    <div class="card pad"><div class="kv"><span>${t('remindersN', { n: own.length || S.rules.filter((x) => !x.item_id).length })}</span><b>${own.length ? t('ownReminders') : t('usingDefaults')}</b></div><p class="small muted">${esc((own.length ? own : S.rules.filter((x) => !x.item_id)).map(ruleSummary).join(' · ') || t('noReminders'))}</p><a class="btn line" href="#/reminders/${i.id}">${icon('bell')}${t('changeReminders')}</a></div>
+    <button class="btn soft" data-act="toShop" data-id="${i.id}">${t('addToShopping')}</button>
     ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ''}
     <button class="link danger center" data-act="delItem" data-id="${i.id}">${t('deleteItem')}</button></main>`;
 }
 
 function blankDraft(r) {
-  return { id: null, name: S.q || '', category_id: cat(r.q.get('cat')) ? r.q.get('cat') : '', quantity: 1, unit: '', printed_date: '', after_opening_days: '', date_type: 'expiration', estimated: false, location: '', notes: '', manufactured_on: '', interval_days: '', opened_on: '', running_out: false };
+  return { id: null, name: S.q || '', category_id: cat(r.q.get('cat')) ? r.q.get('cat') : '', quantity: '1', unit: '', printed_date: '', after_opening_days: '', date_type: 'expiration', estimated: false, location: '', notes: '', manufactured_on: '', interval_days: '', opened_on: '', running_out: false };
 }
+const DATE_FIELDS = ['printed_date', 'opened_on', 'manufactured_on'];
+// One labelled field: label (with * when required), an (i) button that shows what the field is for, the control, and a line for the red message.
+function field(name, label, control, { tipKey = '', req = false } = {}) {
+  return `<div class="field"><div class="lab-row"><label for="f-${name}">${label}${req ? ` <span class="req" title="${t('required')}">*</span>` : ''}</label>${tipKey ? infoBtn() : ''}</div>${tipKey ? `<p class="tip" hidden>${t(tipKey)}</p>` : ''}${control}<p class="msg" role="alert"></p></div>`;
+}
+const textCtl = (name, value, attrs = '') => `<input id="f-${name}" name="${name}" value="${esc(value ?? '')}" autocomplete="off" ${attrs}>`;
+// Dates are typed in the format chosen under More → Date format; the calendar button opens the phone's own picker.
+const dateCtl = (name, value, max = '') => `<div class="datebox"><input id="f-${name}" name="${name}" value="${esc(value ?? '')}" data-v="date" ${max ? `data-max="${max}"` : ''} inputmode="numeric" autocomplete="off" placeholder="${datePlaceholder()}" maxlength="10"><button type="button" class="round flat" data-act="pick" data-for="${name}" aria-label="${t('calendar')}">${icon('cal')}</button><input type="date" class="native-date" tabindex="-1" aria-hidden="true" data-native="${name}" min="1990-01-01" max="${max === 'today' ? today() : '2099-12-31'}"></div>`;
+
 function vEdit(r) {
   if (!S.draft || S.draft._for !== r.id) {
     const src = r.id === 'new' ? blankDraft(r) : item(r.id);
     if (!src) return `<main class="page">${top(t('back'))}${empty(t('itemGone'))}</main>`;
-    S.draft = { ...src, _for: r.id };
-    S.more = false;
+    S.draft = { ...src, _for: r.id, quantity: String(num(src.quantity)) };
+    DATE_FIELDS.forEach((k) => { S.draft[k] = src[k] ? fmtDate(src[k]) : ''; });
+    S.more = !!(src.after_opening_days || src.opened_on);
   }
-  const d = S.draft, v = (k) => esc(d[k] ?? '');
-  const dateAttrs = 'min="2000-01-01" max="2099-12-31"';
+  const d = S.draft;
   return `<main class="page with-save"><div class="top"><button class="link" data-act="back">${t('cancel')}</button><h1 class="h-small">${r.id === 'new' ? t('newItem') : t('editItem')}</h1><span class="spacer"></span></div>
     <form id="item-form" novalidate>
-    <label class="field"><span>${t('name')}</span><input name="name" value="${v('name')}" maxlength="120" required autocomplete="off"></label>
-    <div class="field"><span>${t('category')}</span><div class="chips wrap">${S.cats.map((c) => `<button type="button" class="chip big ${d.category_id === c.id ? 'on' : ''}" aria-pressed="${d.category_id === c.id}" data-act="pickCat" data-id="${c.id}">${esc(c.name)}</button>`).join('')}<button type="button" class="chip big dashed" data-act="newCatInForm">${t('newCategory')}</button></div></div>
-    <div class="grid2"><div class="field"><span>${t('howMany')}</span><div class="stepper"><button type="button" data-act="step" data-d="-1" aria-label="${t('fewer')}">−</button><input name="quantity" type="number" inputmode="decimal" min="0" max="99999" step="any" value="${v('quantity')}" aria-label="${t('howMany')}"><button type="button" data-act="step" data-d="1" aria-label="${t('moreQty')}">+</button></div></div>
-    <label class="field"><span>${t('unit')}</span><input name="unit" value="${v('unit')}" maxlength="20" placeholder="${t('unitPlaceholder')}"></label></div>
-    <label class="field"><span>${t('dateOnPackage')}</span><input name="printed_date" type="date" ${dateAttrs} value="${v('printed_date')}"></label>
-    <div class="card pad"><label class="inline between" for="pao"><span class="row-t">${t('afterOpeningUse')}</span><span class="inline"><input id="pao" name="after_opening_days" type="number" inputmode="numeric" min="1" max="3650" step="1" class="tiny" value="${v('after_opening_days')}"><span>${t('days')}</span></span></label><p class="small muted">${t('afterOpeningHint')}</p></div>
-    <button type="button" class="row cardlike" data-act="toggleMore" aria-expanded="${S.more}"><span class="row-t">${t('moreDetails')}</span>${icon(S.more ? 'up' : 'down')}</button>
-    ${S.more ? `<label class="field"><span>${t('dateType')}</span><select name="date_type">${['expiration', 'bestBefore', 'sellBy', 'replaceBy', 'none'].map((k) => `<option value="${k}" ${d.date_type === k ? 'selected' : ''}>${t('dt_' + k)}</option>`).join('')}</select></label>
-      <label class="check"><input type="checkbox" name="estimated" ${d.estimated ? 'checked' : ''}>${t('dateEstimated')}</label>
-      <div class="grid2"><label class="field"><span>${t('openedOn')}</span><input name="opened_on" type="date" min="2000-01-01" max="${today()}" value="${v('opened_on')}"></label><label class="field"><span>${t('madeOn')}</span><input name="manufactured_on" type="date" min="1990-01-01" max="${today()}" value="${v('manufactured_on')}"></label></div>
-      <label class="field"><span>${t('replaceEvery')}</span><input name="interval_days" type="number" inputmode="numeric" min="1" max="3650" step="1" value="${v('interval_days')}"></label>
-      <label class="field"><span>${t('location')}</span><input name="location" value="${v('location')}" maxlength="80"></label>
-      <label class="check"><input type="checkbox" name="running_out" ${d.running_out ? 'checked' : ''}>${t('markLow')}</label>
-      <label class="field"><span>${t('notes')}</span><textarea name="notes" maxlength="1000" rows="3">${v('notes')}</textarea></label>` : ''}
-    <p class="small muted">${r.id === 'new' ? t('remindersDefaultNote') : ''}</p>
+    <p class="small muted"><span class="req">*</span> ${t('required')}</p>
+    ${field('name', t('name'), textCtl('name', d.name, 'data-v="name" maxlength="120"'), { req: true })}
+    <div class="field"><div class="lab-row"><span class="lab">${t('category')}</span>${infoBtn()}</div><p class="tip" hidden>${t('tip_category')}</p><div class="chips wrap">${S.cats.map((c) => `<button type="button" class="chip big ${d.category_id === c.id ? 'on' : ''}" aria-pressed="${d.category_id === c.id}" data-act="pickCat" data-id="${c.id}">${esc(c.name)}</button>`).join('')}<button type="button" class="chip big dashed" data-act="newCatInForm">${t('newCategory')}</button></div></div>
+    <div class="grid2">${field('quantity', t('howMany'), `<div class="stepper"><button type="button" data-act="step" data-d="-1" aria-label="${t('fewer')}">−</button><input id="f-quantity" name="quantity" inputmode="decimal" data-v="qty" value="${esc(d.quantity)}" autocomplete="off"><button type="button" data-act="step" data-d="1" aria-label="${t('moreQty')}">+</button></div>`, { tipKey: 'tip_qty' })}
+    ${field('unit', t('unit'), textCtl('unit', d.unit, `maxlength="20" placeholder="${t('unitPlaceholder')}"`), { tipKey: 'tip_unit' })}</div>
+    ${field('printed_date', t('dateOnPackage'), dateCtl('printed_date', d.printed_date), { tipKey: 'tip_date' })}
+    <button type="button" class="row cardlike" data-act="toggleMore" aria-expanded="${S.more}"><span class="grow"><span class="row-t">${t('moreDetails')}</span><span class="row-m">${t('moreDetailsSub')}</span></span>${icon(S.more ? 'up' : 'down')}</button>
+    ${S.more ? `${field('after_opening_days', t('afterOpeningUse'), `<div class="inline">${textCtl('after_opening_days', d.after_opening_days, 'data-v="days" inputmode="numeric" class="tiny"')}<span>${t('days')}</span></div>`, { tipKey: 'tip_pao' })}
+      ${field('opened_on', t('openedOn'), dateCtl('opened_on', d.opened_on, 'today'), { tipKey: 'tip_openedOn' })}
+      ${field('date_type', t('dateType'), `<select id="f-date_type" name="date_type">${['expiration', 'bestBefore', 'sellBy', 'replaceBy', 'none'].map((k) => `<option value="${k}" ${d.date_type === k ? 'selected' : ''}>${t('dt_' + k)}</option>`).join('')}</select>`, { tipKey: 'tip_dateType' })}
+      <div class="field"><div class="lab-row"><label class="check"><input type="checkbox" name="estimated" ${d.estimated ? 'checked' : ''}>${t('dateEstimated')}</label>${infoBtn()}</div><p class="tip" hidden>${t('tip_estimated')}</p></div>
+      ${field('manufactured_on', t('madeOn'), dateCtl('manufactured_on', d.manufactured_on, 'today'), { tipKey: 'tip_madeOn' })}
+      ${field('interval_days', t('replaceEvery'), `<div class="inline">${textCtl('interval_days', d.interval_days, 'data-v="days" inputmode="numeric" class="tiny"')}<span>${t('days')}</span></div>`, { tipKey: 'tip_replace' })}
+      ${field('location', t('location'), textCtl('location', d.location, `maxlength="80" placeholder="${t('locationPlaceholder')}"`), { tipKey: 'tip_location' })}
+      <div class="field"><div class="lab-row"><label class="check"><input type="checkbox" name="running_out" ${d.running_out ? 'checked' : ''}>${t('markLow')}</label>${infoBtn()}</div><p class="tip" hidden>${t('tip_low')}</p></div>
+      ${field('notes', t('notes'), `<textarea id="f-notes" name="notes" maxlength="1000" rows="3">${esc(d.notes ?? '')}</textarea>`)}` : ''}
+    ${r.id === 'new' ? `<p class="small muted">${t('remindersDefaultNote')}</p>` : `<a class="btn line" href="#/reminders/${r.id}">${icon('bell')}${t('changeReminders')}</a>`}
     <p id="form-error" class="error" role="alert"></p>
     <div class="savebar"><button class="btn pri big" type="submit">${t('save')}</button></div></form></main>`;
 }
@@ -312,11 +391,11 @@ function vReminders(r) {
       ${x.repeat_every_amount ? `<div class="inline"><span>${t('every')}</span><input name="repeat_every_amount" type="number" inputmode="numeric" min="1" max="10000" class="tiny" value="${x.repeat_every_amount}" aria-label="${t('amount')}">${unitSel('repeat_every_unit', x.repeat_every_unit)}</div>
         <label class="inline"><input type="radio" name="stop" value="count" ${x.repeat_count ? 'checked' : ''}>${t('stopAfter')}<input name="repeat_count" type="number" inputmode="numeric" min="1" max="100" class="tiny" value="${x.repeat_count || 3}" aria-label="${t('times')}">${t('moreTimes')}</label>
         <label class="inline"><input type="radio" name="stop" value="done" ${x.repeat_count ? '' : 'checked'}>${t('keepUntilDone')}</label>` : ''}
-      <p class="hint">${esc(fireText(x, i))}</p><p class="error" role="alert"></p></form>`;
+      <p class="hint">${esc(fireText(x, i))}</p><p class="error" role="alert"></p>${x.item_id ? `<button type="button" class="btn soft" data-act="makeDefault" data-id="${x.id}">${t('makeDefault')}</button>` : ''}</form>`;
   };
-  const body = !isDefault && !own.length
-    ? `<p class="hint">${t('usingDefaultsLong')}</p>${card(defaults.map((x) => `<div class="row"><span class="row-t">${esc(ruleSummary(x))}</span></div>`).join('') || empty(t('noReminders')))}<button class="btn line" data-act="copyDefaults" data-id="${r.id}">${t('customizeForItem')}</button>`
-    : `${own.map((x, n) => box(x, n + 1)).join('') || empty(t('noReminders'))}<button class="btn dashed" data-act="addRule" data-id="${r.id}">${t('addReminder')}</button>${!isDefault ? `<button class="link center" data-act="useDefaults" data-id="${r.id}">${t('backToDefaults')}</button>` : ''}`;
+  const inherited = !isDefault && !own.length;
+  const shownRules = inherited ? defaults : own;
+  const body = `${inherited ? `<p class="hint">${t('usingDefaultsLong')}</p>` : ''}${shownRules.map((x, n) => box(x, n + 1)).join('') || empty(t('noReminders'))}<button class="btn dashed" data-act="addRule" data-id="${r.id}">${t('addReminder')}</button>${!isDefault && own.length ? `<button class="link center" data-act="useDefaults" data-id="${r.id}">${t('backToDefaults')}</button>` : ''}`;
   return `<main class="page">${top(t('back'), `<button class="link" data-act="back">${t('done')}</button>`)}${h1(isDefault ? t('defaultReminders') : t('reminders'), isDefault ? t('defaultRemindersSub') : `${i.name}${i.due_date ? ' · ' + t('dueOn', { d: fmtDate(i.due_date) }) : ''}`)}
     <p class="notice">${t('pushLater')}</p>${body}</main>`;
 }
@@ -328,9 +407,10 @@ function fireText(x, i) {
 }
 
 function vAlerts() {
-  const list = S.items.filter(needsAttention).sort(urgency);
+  const list = S.items.filter(needsAttention).sort(urgency), later = S.items.filter((i) => dueSoon(i) && snoozed(i)).sort(urgency);
   return `<main class="page with-nav">${h1(t('reminders'), list.length ? t('toDealWith', { n: list.length }) : t('allClear'))}<p class="notice">${t('pushLater')}</p>
-    ${list.map((i) => `<div class="card pad"><a class="row bare" href="#/item/${i.id}"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${meta(i)}</span></span>${pill(i)}</a>${quickBtns(i)}</div>`).join('') || empty(t('nothingDue'))}</main>${nav('alerts')}`;
+    ${list.map((i) => `<div class="card pad"><a class="row bare" href="#/item/${i.id}"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${meta(i)}</span></span>${pill(i)}</a>${quickBtns(i)}<button class="btn soft" data-act="snooze" data-id="${i.id}">${t('remindLater')}</button></div>`).join('') || empty(t('nothingDue'))}
+    ${later.length ? `<p class="sec">${t('snoozedSection')}</p>${later.map((i) => `<div class="card pad"><a class="row bare" href="#/item/${i.id}"><span class="grow"><span class="row-t">${esc(i.name)}</span><span class="row-m">${esc(t('snoozedUntil', { d: fmtDateTime(i.snoozed_until) }))}</span></span>${pill(i)}</a><button class="btn line" data-act="wake" data-id="${i.id}">${t('remindNow')}</button></div>`).join('')}` : ''}</main>${nav('alerts')}`;
 }
 
 function vAssistant() {
@@ -342,7 +422,7 @@ function vMore() {
   return `<main class="page">${top(t('home'))}${h1(t('more'), `${S.hh.name} · ${guest ? t('guestMode') : t('signedIn')}`)}
     ${card(rowLink('#/shopping', t('shoppingList'), '', `<span class="muted small">${t('nToBuy', { n: S.shop.filter((x) => !x.checked).length })}</span>`))}
     ${card(rowLink('#/reminders/default', t('defaultReminders'), esc(S.rules.filter((x) => !x.item_id).map(ruleSummary).join(' · ') || t('noReminders'))) + rowLink('#/categories', t('categories'), '', `<span class="muted small">${S.cats.length}</span>`) + rowLink('#/customize', t('homeScreen'), ''))}
-    ${card(`<button class="row" data-act="rename"><span class="row-t">${t('homeName')}</span><span class="muted small">${esc(S.hh.name)}</span></button><button class="row" data-act="copyCode"><span class="grow"><span class="row-t">${t('familyCode')}</span><span class="row-m">${t('familyCodeSub')}</span></span><span class="link">${t('copy')}</span></button><button class="row" data-act="lang"><span class="row-t">${t('language')}</span><span class="muted small">${getLang() === 'en' ? 'English' : '한국어'}</span></button><button class="row" data-act="signOut"><span class="row-t danger">${t('signOut')}</span></button>`)}
+    ${card(`<button class="row" data-act="rename"><span class="row-t">${t('homeName')}</span><span class="muted small">${esc(S.hh.name)}</span></button><button class="row" data-act="copyCode"><span class="grow"><span class="row-t">${t('familyCode')}</span><span class="row-m">${t('familyCodeSub')}</span></span><span class="link">${t('copy')}</span></button><button class="row" data-act="lang"><span class="row-t">${t('language')}</span><span class="muted small">${getLang() === 'en' ? 'English' : '한국어'}</span></button><button class="row" data-act="dateFmt"><span class="row-t">${t('dateFormat')}</span><span class="muted small">${fmtDate(today())}</span></button><button class="row" data-act="signOut"><span class="row-t danger">${t('signOut')}</span></button>`)}
     <p class="small muted center">${t('version')}</p></main>`;
 }
 
@@ -350,7 +430,7 @@ function vShopping() {
   const row = (x) => `<label class="row"><input type="checkbox" class="sw" data-shop="${x.id}" ${x.checked ? 'checked' : ''}><span class="grow ${x.checked ? 'done' : ''}"><span class="row-t">${esc(x.name)}</span><span class="row-m">${num(x.quantity)} ${esc(x.unit)}</span></span><button type="button" class="round flat" data-act="delShop" data-id="${x.id}" aria-label="${t('delete')}">${icon('close')}</button></label>`;
   const open = S.shop.filter((x) => !x.checked), done = S.shop.filter((x) => x.checked);
   return `<main class="page">${top(t('back'))}${h1(t('shoppingList'), t('shoppingSub'))}
-    <form id="shop-form" class="inline"><input name="name" maxlength="120" required placeholder="${t('addToBuy')}" aria-label="${t('addToBuy')}"><button class="btn pri">${t('add')}</button></form>
+    <form id="shop-form" class="inline" novalidate><div class="fl-wrap grow">${floating('name', t('addToBuy'), 'maxlength="120"')}</div><button class="btn pri">${t('add')}</button></form>
     ${open.length ? card(open.map(row).join('')) : empty(t('nothingToBuy'))}${done.length ? `<div class="h2"><h2>${t('bought')}</h2></div>${card(done.map(row).join(''))}` : ''}</main>`;
 }
 
@@ -390,6 +470,8 @@ function render() {
   }
   $('#app').innerHTML = (VIEWS[r.name] || vHome)(r);
   if (r.name === 'items' && r.q.get('focus') && !S.q) $('#search')?.focus();
+  // Redrawing a form (opening More details, picking a category) must not lose the red marks.
+  if (r.name === 'edit') document.querySelectorAll('#item-form [data-v]').forEach((el) => { if (el.value) check(el, false); });
 }
 
 // ---------- actions ----------
@@ -404,13 +486,23 @@ const A = {
     await api.signOut(); Object.assign(S, { user: null, hh: null, ready: false, items: [], cats: [], rules: [], shop: [], layout: DEFAULT_LAYOUT }); go('#/home'); render();
   }),
   filter: (d) => { S.filter = d.f; render(); },
-  usedOne: (d) => run(async () => { const i = item(d.id); const q = Math.max(0, num(i.quantity) - 1); await patchItem(i, { quantity: q, running_out: q === 0 ? true : i.running_out }, t('usedOneDone', { name: i.name }), 'consumed', Math.min(1, num(i.quantity))); }),
-  usedUp: (d) => run(async () => { const i = item(d.id); await patchItem(i, { quantity: 0, running_out: true }, t('usedUpDone', { name: i.name }), 'consumed', num(i.quantity)); }),
-  threw: (d) => run(async () => { const i = item(d.id); await patchItem(i, { quantity: 0 }, t('threwDone', { name: i.name }), 'wasted', num(i.quantity)); }),
+  tip: (d, el) => { const p = el.closest('.field').querySelector('.tip'); p.hidden = !p.hidden; el.setAttribute('aria-expanded', String(!p.hidden)); },
+  pick: (d) => { const n = $(`[data-native="${d.for}"]`), cur = toIso($(`#f-${d.for}`).value); if (cur) n.value = cur; try { n.showPicker(); } catch { n.focus(); } },
+  dateFmt: () => run(async () => { const v = await choose({ title: t('dateFormat'), body: t('dateFormatQ'), options: Object.keys(DATE_FORMATS).map((k) => ({ value: k, on: k === getDateFormat(), label: fmtDate(today(), k) + '  ·  ' + datePlaceholder(k) })) }); if (!v) return; setDateFormat(v); render(); await api.saveSettings(S.user.id, { date_format: v }).catch(() => {}); }),
+  snooze: (d) => run(async () => {
+    const i = item(d.id), now = new Date(), at = (days, h) => { const x = new Date(); x.setDate(x.getDate() + days); x.setHours(h, 0, 0, 0); return x; };
+    const options = [{ label: t('in1h'), value: new Date(now.getTime() + 36e5) }, ...(now.getHours() < 20 ? [{ label: t('tonight'), value: at(0, 21) }] : []), { label: t('tomorrowMorning'), value: at(1, 9) }, { label: t('in3days'), value: at(3, 9) }];
+    const when = await choose({ title: t('remindLaterQ', { name: i.name }), body: t('snoozeNote'), options });
+    if (when) await patchItem(i, { snoozed_until: when.toISOString() }, t('snoozeDone', { d: fmtDateTime(when) }));
+  }),
+  wake: (d) => run(async () => { await patchItem(item(d.id), { snoozed_until: null }, t('saved')); }),
+  usedOne: (d) => run(async () => { const i = item(d.id), q = num(i.quantity) - 1; if (q <= 0) return removeItem(i, t('usedUpDone', { name: i.name }), 'consumed', num(i.quantity)); await patchItem(i, { quantity: q }, t('usedOneDone', { name: i.name }), 'consumed', 1); }),
+  usedUp: (d) => run(async () => { const i = item(d.id); await removeItem(i, t('usedUpDone', { name: i.name }), 'consumed', num(i.quantity)); }),
+  threw: (d) => run(async () => { const i = item(d.id); await removeItem(i, t('threwDone', { name: i.name }), 'wasted', num(i.quantity)); }),
   openToday: (d) => run(async () => { const i = item(d.id); await patchItem(i, { opened_on: today() }, t('openedDone', { d: fmtDate(addDays(today(), i.after_opening_days)) }), 'opened', 0); }),
-  openOther: (d) => run(async () => { const i = item(d.id); const v = await ask({ title: t('whenOpened'), input: today(), type: 'date', ok: t('save') }); if (!v) return; if (v > today()) return toast(t('errFutureOpen')); await patchItem(i, { opened_on: v }, t('openedDone', { d: fmtDate(addDays(v, i.after_opening_days)) }), 'opened', 0); }),
+  openOther: (d) => run(async () => { const i = item(d.id); const v = await ask({ title: t('whenOpened'), input: fmtDate(today()), v: 'date', max: 'today', placeholder: datePlaceholder(), ok: t('save') }); const day = v && toIso(v); if (!day) return; await patchItem(i, { opened_on: day }, t('openedDone', { d: fmtDate(addDays(day, i.after_opening_days)) }), 'opened', 0); }),
   unopen: (d) => run(async () => { await patchItem(item(d.id), { opened_on: null }, t('markedUnopened')); }),
-  setPao: (d) => run(async () => { const v = await ask({ title: t('afterOpeningUse'), body: t('afterOpeningHint'), input: '', type: 'number', ok: t('save') }); const n = Math.floor(Number(v)); if (!v) return; if (!(n >= 1 && n <= 3650)) return toast(t('errDays')); await patchItem(item(d.id), { after_opening_days: n }, t('saved')); }),
+  setPao: (d) => run(async () => { const v = await ask({ title: t('afterOpeningUse'), body: t('afterOpeningHint'), input: '', v: 'days', placeholder: t('days'), ok: t('save') }); if (!v) return; await patchItem(item(d.id), { after_opening_days: Number(v) }, t('saved')); }),
   replaced: (d) => run(async () => { const i = item(d.id); await patchItem(i, { date_type: 'replaceBy', printed_date: addDays(today(), i.interval_days), acquired_on: today(), opened_on: null, quantity: Math.max(1, num(i.quantity)), running_out: false, estimated: false }, t('replacedDone', { d: fmtDate(addDays(today(), i.interval_days)) })); }),
   toShop: (d) => run(async () => {
     const i = item(d.id);
@@ -419,18 +511,10 @@ const A = {
     await load('shop'); render();
     toast(t('addedToShopping', { name: i.name }), async () => { await api.remove('shopping_entries', row.id); await load('shop'); render(); toast(t('undone')); });
   }),
-  delItem: (d) => run(async () => {
-    const i = item(d.id);
-    if (!(await ask({ title: t('deleteQ', { name: i.name }), ok: t('delete'), danger: true }))) return;
-    const rules = S.rules.filter((x) => x.item_id === i.id);
-    await api.remove('items', i.id); await load('items', 'rules');
-    back();
-    const { due_date, created_at, updated_at, ...row } = i;
-    toast(t('deletedDone', { name: i.name }), async () => { await api.insert('items', row); for (const { created_at: c, updated_at: u, ...x } of rules) await api.insert('reminder_rules', x); await load('items', 'rules'); render(); toast(t('undone')); });
-  }),
+  delItem: (d) => run(async () => { const i = item(d.id); if (!(await ask({ title: t('deleteQ', { name: i.name }), ok: t('delete'), danger: true }))) return; await removeItem(i, t('deletedDone', { name: i.name })); }),
   pickCat: (d) => { readForm(); S.draft.category_id = S.draft.category_id === d.id ? '' : d.id; render(); },
   toggleMore: () => { readForm(); S.more = !S.more; render(); },
-  step: (d) => { readForm(); S.draft.quantity = Math.max(0, (Number(S.draft.quantity) || 0) + Number(d.d)); render(); },
+  step: (d) => { readForm(); S.draft.quantity = String(Math.max(1, (Number(String(S.draft.quantity).replace(',', '.')) || 0) + Number(d.d))); render(); },
   newCat: () => run(async () => { const c = await createCategory(); if (c) { await load('cats'); render(); } }),
   newCatInForm: () => run(async () => { readForm(); const c = await createCategory(); if (c) { await load('cats'); S.draft.category_id = c.id; render(); } }),
   renameCat: (d) => run(async () => { const c = cat(d.id); const v = await ask({ title: t('renameCategory'), input: c.name, ok: t('save') }); if (!v || v === c.name) return; await api.update('categories', c.id, { name: v }); await load('cats'); render(); }),
@@ -440,16 +524,34 @@ const A = {
     await api.remove('categories', c.id); await load('cats', 'items'); render(); toast(t('deletedDone', { name: c.name }));
   }),
   rename: () => run(async () => { const v = await ask({ title: t('homeName'), input: S.hh.name, ok: t('save') }); if (!v) return; await api.update('households', S.hh.id, { name: v.slice(0, 40) }); S.hh.name = v.slice(0, 40); render(); }),
+  makeDefault: (d) => run(async () => {
+    await saveOpenRule();
+    const { id, item_id, household_id, created_at, updated_at, ...rule } = S.rules.find((x) => x.id === d.id);
+    const same = (a) => Object.keys(rule).every((k) => String(a[k] ?? '') === String(rule[k] ?? ''));
+    if (S.rules.some((x) => !x.item_id && same(x))) return toast(t('alreadyDefault'));
+    const made = await api.insert('reminder_rules', { ...rule, household_id, item_id: null });
+    await load('rules'); render();
+    toast(t('madeDefault'), async () => { await api.remove('reminder_rules', made.id); await load('rules'); render(); toast(t('undone')); });
+  }),
   copyCode: () => run(async () => { try { await navigator.clipboard.writeText(S.hh.join_code); toast(t('codeCopied')); } catch { await ask({ title: t('familyCode'), body: S.hh.join_code, ok: t('ok') }); } }),
-  openRule: (d) => run(async () => { await saveOpenRule(); S.openRule = d.id || null; render(); }),
-  addRule: (d) => run(async () => { await saveOpenRule(); const row = await api.insert('reminder_rules', { household_id: S.hh.id, item_id: d.id === 'default' ? null : d.id, anchor: 'due', offset_amount: 1, offset_unit: 'days', at_time: '09:00' }); await load('rules'); S.openRule = row.id; render(); }),
-  delRule: (d) => run(async () => { const { created_at, updated_at, ...row } = S.rules.find((x) => x.id === d.id); await api.remove('reminder_rules', d.id); S.openRule = null; await load('rules'); render(); toast(t('reminderDeleted'), async () => { await api.insert('reminder_rules', row); await load('rules'); render(); toast(t('undone')); }); }),
-  copyDefaults: (d) => run(async () => { for (const { id, created_at, updated_at, ...x } of S.rules.filter((r) => !r.item_id)) await api.insert('reminder_rules', { ...x, item_id: d.id }); await load('rules'); render(); }),
+  openRule: (d) => run(async () => { await saveOpenRule(); S.openRule = d.id ? await ownRule(d.id) : null; render(); }),
+  addRule: (d) => run(async () => { await saveOpenRule(); await ownRule(null); const row = await api.insert('reminder_rules', { household_id: S.hh.id, item_id: d.id === 'default' ? null : d.id, anchor: 'due', offset_amount: 1, offset_unit: 'days', at_time: '09:00' }); await load('rules'); S.openRule = row.id; render(); }),
+  delRule: (d) => run(async () => { d = { id: await ownRule(d.id) }; const { created_at, updated_at, ...row } = S.rules.find((x) => x.id === d.id); await api.remove('reminder_rules', d.id); S.openRule = null; await load('rules'); render(); toast(t('reminderDeleted'), async () => { await api.insert('reminder_rules', row); await load('rules'); render(); toast(t('undone')); }); }),
   useDefaults: (d) => run(async () => { if (!(await ask({ title: t('backToDefaultsQ'), ok: t('ok') }))) return; for (const x of S.rules.filter((r) => r.item_id === d.id)) await api.remove('reminder_rules', x.id); S.openRule = null; await load('rules'); render(); }),
   delShop: (d) => run(async () => { await api.remove('shopping_entries', d.id); await load('shop'); render(); }),
   move: (d) => run(async () => { const o = [...S.layout.order], group = o.filter((x) => S.layout.hidden.includes(x) === S.layout.hidden.includes(d.id)), n = group.indexOf(d.id), other = group[n + Number(d.d)]; if (!other) return; const a = o.indexOf(d.id), b = o.indexOf(other); [o[a], o[b]] = [o[b], o[a]]; await saveLayout({ ...S.layout, order: o }); }),
   resetLayout: () => run(() => saveLayout(DEFAULT_LAYOUT)),
 };
+// On an item that still uses the home defaults, the first change gives the item its own copy of them,
+// so the change never touches other items. Returns the id of the item's copy of the given rule.
+async function ownRule(ruleId) {
+  const r = route();
+  if (r.name !== 'reminders' || r.id === 'default' || S.rules.some((x) => x.item_id === r.id)) return ruleId;
+  let mine = ruleId;
+  for (const { id, created_at, updated_at, ...x } of S.rules.filter((y) => !y.item_id)) { const made = await api.insert('reminder_rules', { ...x, item_id: r.id }); if (id === ruleId) mine = made.id; }
+  await load('rules');
+  return mine;
+}
 async function saveLayout(layout) { S.layout = layout; render(); await api.saveSettings(S.user.id, { home_layout: layout }); }
 async function createCategory() {
   const v = await ask({ title: t('newCategoryTitle'), input: '', ok: t('create') });
@@ -482,18 +584,16 @@ async function saveOpenRule() {
 
 async function saveItem() {
   readForm();
-  const d = S.draft, err = (m) => { $('#form-error').textContent = m; $('#form-error').scrollIntoView({ block: 'center' }); };
-  const name = String(d.name).trim(), n = Number(d.quantity);
-  if (!name) return err(t('errName'));
-  if (d.quantity === '' || !Number.isFinite(n) || n < 0 || n > 99999) return err(t('errQuantity'));
-  const days = (v, label) => { if (v === '' || v === null || v === undefined) return null; const k = Math.floor(Number(v)); if (!(k >= 1 && k <= 3650)) throw new Error(label); return k; };
-  let pao, interval;
-  try { pao = days(d.after_opening_days, t('errDays')); interval = days(d.interval_days, t('errDays')); } catch (e) { return err(e.message); }
-  const bad = (v) => v && !/^(19|20)\d\d-\d\d-\d\d$/.test(v);
-  if (bad(d.printed_date) || bad(d.opened_on) || bad(d.manufactured_on)) return err(t('errDate'));
-  if (d.opened_on && d.opened_on > today()) return err(t('errFutureOpen'));
-  if (d.manufactured_on && d.printed_date && d.printed_date < d.manufactured_on) return err(t('errDateOrder'));
-  const row = { name, category_id: d.category_id || null, quantity: n, unit: String(d.unit || '').trim(), printed_date: d.printed_date || null, after_opening_days: pao, date_type: d.date_type || 'expiration', estimated: !!d.estimated, location: String(d.location || '').trim(), notes: String(d.notes || '').trim(), manufactured_on: d.manufactured_on || null, interval_days: interval, opened_on: d.opened_on || null, running_out: !!d.running_out };
+  const f = $('#item-form'), d = S.draft, err = (m) => { $('#form-error').textContent = m; $('#form-error').scrollIntoView({ block: 'center' }); };
+  const wrong = [...f.querySelectorAll('[data-v]')].filter((el) => check(el, true));
+  if (wrong.length) { err(t('errFixRed')); return wrong[0].focus(); }
+  $('#form-error').textContent = '';
+  const name = String(d.name).trim(), n = Number(String(d.quantity).replace(',', '.'));
+  const int = (x) => (x === '' || x === null || x === undefined ? null : Number(x));
+  const dates = Object.fromEntries(DATE_FIELDS.map((k) => [k, toIso(d[k])]));
+  if (dates.manufactured_on && dates.printed_date && dates.printed_date < dates.manufactured_on) return err(t('errDateOrder'));
+  const interval = int(d.interval_days);
+  const row = { name, category_id: d.category_id || null, quantity: n, unit: String(d.unit || '').trim(), ...dates, after_opening_days: int(d.after_opening_days), date_type: d.date_type || 'expiration', estimated: !!d.estimated, location: String(d.location || '').trim(), notes: String(d.notes || '').trim(), interval_days: interval, running_out: !!d.running_out };
   if (row.date_type === 'replaceBy' && !row.printed_date && interval) row.printed_date = addDays(today(), interval);
   await run(async () => {
     if (d.id) { await api.update('items', d.id, row); await load('items'); S.draft = null; back(); toast(t('saved')); return; }
@@ -519,10 +619,13 @@ document.addEventListener('submit', (e) => {
   e.preventDefault();
   const f = e.target;
   if (f.id === 'item-form') saveItem();
-  if (f.id === 'join-form') run(async () => { S.user = (await api.user()) || (await api.signInGuest()); await api.rpc('join_household', { code: f.elements.code.value }); await start(); });
+  if (f.id === 'join-form') { const el = f.elements.code; if (!el.value.trim()) { mark(el, t('errCodeFormat')); return el.focus(); } if (check(el, true)) return el.focus(); run(async () => { S.user = (await api.user()) || (await api.signInGuest()); await api.rpc('join_household', { code: el.value.trim().toLowerCase() }); await start(); }); }
   if (f.id === 'shop-form') run(async () => { const name = f.elements.name.value.trim(); if (!name) return; const linked = S.items.find((i) => i.name.toLowerCase() === name.toLowerCase()); await api.insert('shopping_entries', { household_id: S.hh.id, name, quantity: 1, unit: linked?.unit || '', item_id: linked?.id || null }); await load('shop'); render(); $('#shop-form input')?.focus(); });
 });
 document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (el.dataset.v) { if (el.dataset.v === 'date') el.value = maskDate(el.value); check(el, false); }
+  if (el.dataset.native) { const box = $(`#f-${el.dataset.native}`); if (el.value) { box.value = fmtDate(el.value); check(box, true); } }
   if (e.target.id !== 'search') return;
   S.q = e.target.value;
   const r = route();
@@ -544,10 +647,14 @@ async function toggleShop(id, checked) {
     // An item that only exists because of this tick (made after the entry, nothing else filled in) is removed again.
     const bornHere = i && i.created_at > x.created_at && !i.due_date && !i.category_id && !i.notes && num(i.quantity) <= n;
     if (bornHere) { await api.update('shopping_entries', id, { checked: false, item_id: null }); await api.remove('items', i.id); }
-    else { if (i) await api.update('items', i.id, { quantity: Math.max(0, num(i.quantity) - n) }); await api.update('shopping_entries', id, { checked: false }); }
+    else if (i && num(i.quantity) - n <= 0) { await api.update('shopping_entries', id, { checked: false, item_id: null }); await api.remove('items', i.id); }
+    else { if (i) await api.update('items', i.id, { quantity: num(i.quantity) - n }); await api.update('shopping_entries', id, { checked: false }); }
   }
   await load('items', 'shop'); render();
 }
+document.addEventListener('focusout', (e) => { if (e.target.dataset?.v) check(e.target, true); });
+// A snoozed reminder comes back on its own: redraw the two overview screens once a minute, never while something is being typed.
+setInterval(() => { if (S.ready && ['home', 'alerts'].includes(route().name) && !$('#modal').innerHTML && document.activeElement?.tagName !== 'INPUT') render(); }, 60000);
 window.addEventListener('hashchange', render);
 window.addEventListener('online', () => { $('#offline').hidden = true; });
 window.addEventListener('offline', () => { $('#offline').hidden = false; });
@@ -557,6 +664,7 @@ async function start() {
   await enter();
   const st = await api.settings(S.user.id).catch(() => null);
   if (st?.language && st.language !== getLang()) setLang(st.language);
+  if (st?.date_format) setDateFormat(st.date_format);
   S.ready = true; render();
 }
 (async () => {
